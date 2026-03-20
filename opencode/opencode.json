@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "file:///home/manurodr/workspace/opencode-qgenie-provider/dist/plugin.js"
+  ],
+  "provider": {
+    "qgenie": {
+      "name": "QGenie",
+      "npm": "file:///home/manurodr/workspace/opencode-qgenie-provider",
+     "models": {
+        "anthropic::claude-4-5-opus": {
+          "name": "Claude 4.5 Opus"
+        }
+      },
+      "options": {
+        "baseURL": "https://qpilot-api.qualcomm.com/v1"
+      }
+    }
+  },
+  "formatter": false,
+  "permission": {
+    "edit": "ask",
+    "webfetch": "ask",
+    "websearch": "ask"
+  },
+  "enabled_providers": ["qgenie"]
+}

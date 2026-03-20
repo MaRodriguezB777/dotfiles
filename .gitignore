@@ -1,0 +1,7 @@
+*
+
+!.gitignore
+!opencode/
+!opencode/**
+!nvim/
+!nvim/**

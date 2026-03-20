@@ -1,0 +1,276 @@
+return {}
+-- return {
+--   "sudo-tee/opencode.nvim",
+--   config = function()
+--     -- Register which-key groups for better menu navigation
+--     local ok, wk = pcall(require, "which-key")
+--     if ok then
+--       wk.add({
+--         { "<leader>a", group = "Agent (OpenCode)", icon = "🤖" },
+--         { "<leader>as", group = "Sessions", icon = "📋" },
+--         { "<leader>ad", group = "Diffs", icon = "📝" },
+--         { "<leader>ar", group = "Revert/Restore", icon = "↩️" },
+--         { "<leader>at", group = "Toggle Display", icon = "👁️" },
+--         { "<leader>ax", group = "Debug", icon = "🔧" },
+--       })
+--     end
+--
+--     require("opencode").setup({
+--       preferred_picker = nil,
+--       preferred_completion = nil,
+--       default_global_keymaps = false, -- Disable defaults to avoid conflicts
+--       default_mode = 'build',
+--       default_system_prompt = nil,
+--       keymap_prefix = '<leader>a',
+--       opencode_executable = 'opencode',
+--       keymap = {
+--         editor = {
+--           -- Core actions (single key after <leader>a)
+--           ['<leader>aa'] = { 'toggle', desc = 'Toggle OpenCode panel' },
+--           ['<leader>ai'] = { 'open_input', desc = 'Focus input (insert mode)' },
+--           ['<leader>aI'] = { 'open_input_new_session', desc = 'New session + input' },
+--           ['<leader>ao'] = { 'open_output', desc = 'Focus output' },
+--           ['<leader>af'] = { 'toggle_focus', desc = 'Toggle focus editor/agent' },
+--           ['<leader>aq'] = { 'close', desc = 'Close panel' },
+--           ['<leader>a/'] = { 'quick_chat', mode = { 'n', 'x' }, desc = 'Quick chat with context' },
+--           ['<leader>az'] = { 'toggle_zoom', desc = 'Zoom panel' },
+--           ['<leader>aw'] = { 'swap_position', desc = 'Swap panel left/right' },
+--           ['<leader>av'] = { 'paste_image', desc = 'Paste image' },
+--           ['<leader>am'] = { 'configure_provider', desc = 'Switch model/provider' },
+--           ['<leader>aM'] = { 'configure_variant', desc = 'Switch variant' },
+--
+--           -- Sessions submenu <leader>aS (capital S)
+--           ['<leader>ass'] = { 'select_session', desc = 'Select session' },
+--           ['<leader>asr'] = { 'rename_session', desc = 'Rename session' },
+--           ['<leader>ast'] = { 'timeline', desc = 'Timeline (undo/redo/fork)' },
+--
+--           -- Diffs submenu <leader>aD (capital D)
+--           ['<leader>add'] = { 'diff_open', desc = 'Open diff view' },
+--           ['<leader>adn'] = { 'diff_next', desc = 'Next diff' },
+--           ['<leader>adp'] = { 'diff_prev', desc = 'Previous diff' },
+--           ['<leader>adc'] = { 'diff_close', desc = 'Close diff view' },
+--
+--           -- Revert/Restore submenu <leader>aR (capital R)
+--           ['<leader>ara'] = { 'diff_revert_all_last_prompt', desc = 'Revert all (last prompt)' },
+--           ['<leader>art'] = { 'diff_revert_this_last_prompt', desc = 'Revert this file (last prompt)' },
+--           ['<leader>arA'] = { 'diff_revert_all', desc = 'Revert all (session)' },
+--           ['<leader>arT'] = { 'diff_revert_this', desc = 'Revert this file (session)' },
+--           ['<leader>arf'] = { 'diff_restore_snapshot_file', desc = 'Restore file to snapshot' },
+--           ['<leader>arF'] = { 'diff_restore_snapshot_all', desc = 'Restore all to snapshot' },
+--
+--           -- Toggle display submenu <leader>aT (capital T)
+--           ['<leader>att'] = { 'toggle_tool_output', desc = 'Toggle tool output' },
+--           ['<leader>atr'] = { 'toggle_reasoning_output', desc = 'Toggle reasoning' },
+--         },
+--         input_window = {
+--           ['<S-cr>'] = { 'submit_input_prompt', mode = { 'n', 'i' }, desc = 'Submit prompt' },
+--           ['<esc>'] = { 'close', desc = 'Close panel' },
+--           ['<S-C-n>'] = { 'open_input_new_session', desc = 'New session + input'},
+--           ['<C-c>'] = { 'cancel', desc = 'Cancel request' },
+--           ['~'] = { 'mention_file', mode = 'i', desc = 'Mention file' },
+--           ['@'] = { 'mention', mode = 'i', desc = 'Insert mention' },
+--           ['/'] = { 'slash_commands', mode = 'i', desc = 'Slash commands' },
+--           ['#'] = { 'context_items', mode = 'i', desc = 'Manage context' },
+--           ['<M-v>'] = { 'paste_image', mode = 'i', desc = 'Paste image' },
+--           ['<C-i>'] = { 'focus_input', mode = { 'n', 'i' }, desc = 'Focus input' },
+--           ['<tab>'] = { 'toggle_pane', mode = { 'n', 'i' }, desc = 'Toggle pane' },
+--           ['<up>'] = { 'prev_prompt_history', mode = { 'n', 'i' }, desc = 'Previous prompt' },
+--           ['<down>'] = { 'next_prompt_history', mode = { 'n', 'i' }, desc = 'Next prompt' },
+--           ['<M-m>'] = { 'switch_mode', desc = 'Switch mode' },
+--           ['<M-r>'] = { 'cycle_variant', mode = { 'n', 'i' }, desc = 'Cycle variant' },
+--         },
+--         output_window = {
+--           ['<esc>'] = { 'close', desc = 'Close panel' },
+--           ['<C-c>'] = { 'cancel', desc = 'Cancel request' },
+--           [']]'] = { 'next_message', desc = 'Next message' },
+--           ['[['] = { 'prev_message', desc = 'Previous message' },
+--           ['<tab>'] = { 'toggle_pane', mode = { 'n', 'i' }, desc = 'Toggle pane' },
+--           ['i'] = { 'focus_input', 'n', desc = 'Focus input' },
+--           ['<M-r>'] = { 'cycle_variant', mode = { 'n' }, desc = 'Cycle variant' },
+--           -- Debug submenu <leader>aX (capital X, only in output window)
+--           ['<leader>axs'] = { 'select_child_session', desc = 'Select child session' },
+--           ['<leader>axm'] = { 'debug_message', desc = 'Debug message' },
+--           ['<leader>axo'] = { 'debug_output', desc = 'Debug output' },
+--           ['<leader>axd'] = { 'debug_session', desc = 'Debug session' },
+--         },
+--         session_picker = {
+--           rename_session = { '<C-r>' },
+--           delete_session = { '<C-d>' },
+--           new_session = { '<C-s>' },
+--         },
+--         timeline_picker = {
+--           undo = { '<C-u>', mode = { 'i', 'n' } },
+--           fork = { '<C-f>', mode = { 'i', 'n' } },
+--         },
+--         history_picker = {
+--           delete_entry = { '<C-d>', mode = { 'i', 'n' } },
+--           clear_all = { '<C-X>', mode = { 'i', 'n' } },
+--         },
+--         model_picker = {
+--           toggle_favorite = { '<C-f>', mode = { 'i', 'n' } },
+--         },
+--         mcp_picker = {
+--           toggle_connection = { '<C-t>', mode = { 'i', 'n' } },
+--         },
+--       },
+--       ui = {
+--         position = 'right', -- 'right' (default), 'left' or 'current'. Position of the UI split. 'current' uses the current window for the output.
+--         input_position = 'bottom', -- 'bottom' (default) or 'top'. Position of the input window
+--         window_width = 0.40, -- Width as percentage of editor width
+--         zoom_width = 0.8, -- Zoom width as percentage of editor width
+--         display_model = true, -- Display model name on top winbar
+--         display_context_size = true, -- Display context size in the footer
+--
+--         display_cost = true, -- Display cost in the footer
+--         window_highlight = 'Normal:OpencodeBackground,FloatBorder:OpencodeBorder', -- Highlight group for the opencode window
+--         icons = {
+--           preset = 'nerdfonts', -- 'nerdfonts' | 'text'. Choose UI icon style (default: 'nerdfonts')
+--           overrides = {}, -- Optional per-key overrides, see section below
+--         },
+--         output = {
+--           tools = {
+--
+--             show_output = true, -- Show tools output [diffs, cmd output, etc.] (default: true)
+--             show_reasoning_output = true, -- Show reasoning/thinking steps output (default: true)
+--
+--           },
+--           rendering = {
+--             markdown_debounce_ms = 250, -- Debounce time for markdown rendering on new data (default: 250ms)
+--             on_data_rendered = nil, -- Called when new data is rendered; set to false to disable default RenderMarkdown/Markview behavior
+--           },
+--         },
+--
+--         input = {
+--           min_height = 0.10, -- min height of prompt input as percentage of window height
+--           max_height = 0.25, -- max height of prompt input as percentage of window height
+--           text = {
+--             wrap = false, -- Wraps text inside input window
+--
+--           },
+--           -- Auto-hide input window when prompt is submitted or focus switches to output window
+--           auto_hide = false,
+--         },
+--         picker = {
+--           snacks_layout = nil -- `layout` opts to pass to Snacks.picker.pick({ layout = ... })
+--         },
+--         completion = {
+--           file_sources = {
+--             enabled = true,
+--             preferred_cli_tool = 'server', -- 'fd','fdfind','rg','git','server' if nil, it will use the best available tool, 'server' uses opencode cli to get file list (works cross platform) and supports folders
+--             ignore_patterns = {
+--               '^%.git/',
+--               '^%.svn/',
+--               '^%.hg/',
+--               'node_modules/',
+--               '%.pyc$',
+--               '%.o$',
+--
+--               '%.obj$',
+--
+--               '%.exe$',
+--
+--               '%.dll$',
+--               '%.so$',
+--               '%.dylib$',
+--               '%.class$',
+--               '%.jar$',
+--               '%.war$',
+--               '%.ear$',
+--               'target/',
+--               'build/',
+--               'dist/',
+--               'out/',
+--               'deps/',
+--               '%.tmp$',
+--               '%.temp$',
+--               '%.log$',
+--               '%.cache$',
+--             },
+--             max_files = 10,
+--             max_display_length = 50, -- Maximum length for file path display in completion, truncates from left with "..."
+--
+--           },
+--         },
+--       },
+--       context = {
+--         enabled = true, -- Enable automatic context capturing
+--         cursor_data = {
+--           enabled = false, -- Include cursor position and line content in the context
+--           context_lines = 5, -- Number of lines before and after cursor to include in context
+--         },
+--         diagnostics = {
+--
+--           info = false, -- Include diagnostics info in the context (default to false
+--           warn = true, -- Include diagnostics warnings in the context
+--           error = true, -- Include diagnostics errors in the context
+--           only_closest = false, -- If true, only diagnostics for cursor/selection
+--
+--         },
+--         current_file = {
+--           enabled = true, -- Include current file path and content in the context
+--           show_full_path = true,
+--         },
+--         files = {
+--
+--           enabled = true,
+--
+--           show_full_path = true,
+--         },
+--         selection = {
+--
+--           enabled = true, -- Include selected text in the context
+--         },
+--         buffer = {
+--           enabled = false, -- Disable entire buffer context by default, only used in quick chat
+--         },
+--         git_diff = {
+--           enabled = false,
+--         },
+--       },
+--       debug = {
+--         enabled = false, -- Enable debug messages in the output window
+--         capture_streamed_events = false,
+--         show_ids = true,
+--         quick_chat = {
+--           keep_session = false, -- Keep quick_chat sessions for inspection, this can pollute your sessions list
+--           set_active_session = false,
+--         },
+--       },
+--       prompt_guard = nil, -- Optional function that returns boolean to control when prompts can be sent (see Prompt Guard section)
+--
+--       -- User Hooks for custom behavior at certain events
+--
+--       hooks = {
+--         on_file_edited = nil, -- Called after a file is edited by opencode.
+--         on_session_loaded = nil, -- Called after a session is loaded.
+--         on_done_thinking = nil, -- Called when opencode finishes thinking (all jobs complete).
+--         on_permission_requested = nil, -- Called when a permission request is issued.
+--       },
+--       quick_chat = {
+--         default_model = nil,   -- works better with a fast model like gpt-4.1
+--         default_agent = 'plan', -- plan ensure no file modifications by default
+--         instructions = nil, -- Use built-in instructions if nil
+--       },
+--     })
+--   end,
+--   dependencies = {
+--     "nvim-lua/plenary.nvim",
+--     {
+--       "MeanderingProgrammer/render-markdown.nvim",
+--       opts = {
+--         anti_conceal = { enabled = false },
+--         file_types = { 'markdown', 'opencode_output' },
+--       },
+--       ft = { 'markdown', 'Avante', 'copilot-chat', 'opencode_output' },
+--     },
+--     -- Optional, for file mentions and commands completion, pick only one
+--     'saghen/blink.cmp',
+--     -- 'hrsh7th/nvim-cmp',
+--
+--     -- Optional, for file mentions picker, pick only one
+--     'folke/snacks.nvim',
+--     -- 'nvim-telescope/telescope.nvim',
+--     -- 'ibhagwan/fzf-lua',
+--     -- 'nvim_mini/mini.nvim',
+--   },
+-- }
