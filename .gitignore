@@ -5,3 +5,5 @@
 !opencode/**
 !nvim/
 !nvim/**
+!tmux/
+!tmux/**
