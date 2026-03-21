@@ -1,12 +1,12 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "file:///home/manurodr/workspace/opencode-qgenie-provider/dist/plugin.js"
+    "file://{env:HOME}/workspace/opencode-qgenie-provider/dist/plugin.js"
   ],
   "provider": {
     "qgenie": {
       "name": "QGenie",
-      "npm": "file:///home/manurodr/workspace/opencode-qgenie-provider",
+      "npm": "file://{env:HOME}/workspace/opencode-qgenie-provider",
      "models": {
         "anthropic::claude-4-5-opus": {
           "name": "Claude 4.5 Opus"
