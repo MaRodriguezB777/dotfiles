@@ -1,9 +1,4 @@
-*
-
-!.gitignore
-!opencode/
-!opencode/**
-!nvim/
-!nvim/**
-!tmux/
-!tmux/**
+gh/**
+htop/**
+qgenie-cli/**
+uv/**

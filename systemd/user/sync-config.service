@@ -1,0 +1,7 @@
+[Unit]
+Description=Sync ~/.config from upstream git
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/scripts/sync-config.sh
+

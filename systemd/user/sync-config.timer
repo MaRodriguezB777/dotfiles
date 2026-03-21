@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic ~/.config upstream sync
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+

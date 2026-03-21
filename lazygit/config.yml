@@ -1,0 +1,7 @@
+git:
+  pagers:
+    - pager: delta --color-only --paging=never
+# pagers:
+# - pager: delta --dark --paging=never
+#   colorArg: always
+# - externalDiffCommand: difftastic --color=always
