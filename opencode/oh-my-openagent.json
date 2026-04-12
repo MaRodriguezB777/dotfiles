@@ -1,0 +1,64 @@
+{
+  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-openagent/dev/assets/oh-my-opencode.schema.json",
+  "agents": {
+    "sisyphus": {
+      "model": "QGenie/anthropic::claude-4-5-opus:thinking"
+    },
+    "sisyphus-junior": {
+      "model": "QGenie/anthropic::claude-4-6-sonnet"
+    },
+    "prometheus": {
+      "model": "QGenie/anthropic::claude-4-5-opus:thinking"
+    },
+    "metis": {
+      "model": "QGenie/anthropic::claude-4-5-opus:thinking"
+    },
+    "atlas": {
+      "model": "QGenie/anthropic::claude-4-6-sonnet"
+    },
+    "oracle": {
+      "model": "QGenie/azure::gpt-5.4"
+    },
+    "hephaestus": {
+      "model": "QGenie/azure::gpt-5.4"
+    },
+    "momus": {
+      "model": "QGenie/azure::gpt-5.4"
+    },
+    "explore": {
+      "model": "QGenie/azure::gpt-5.4-mini"
+    },
+    "librarian": {
+      "model": "QGenie/azure::gpt-5.4-mini"
+    },
+    "multimodal-looker": {
+      "model": "QGenie/vertexai::gemini-3.1-pro-preview"
+    }
+  },
+  "categories": {
+    "visual-engineering": {
+      "model": "QGenie/vertexai::gemini-3.1-pro-preview"
+    },
+    "ultrabrain": {
+      "model": "QGenie/anthropic::claude-4-5-opus:thinking"
+    },
+    "deep": {
+      "model": "QGenie/azure::gpt-5.3-codex"
+    },
+    "artistry": {
+      "model": "QGenie/anthropic::claude-4-6-sonnet"
+    },
+    "quick": {
+      "model": "QGenie/azure::gpt-5.4-mini"
+    },
+    "unspecified-low": {
+      "model": "QGenie/azure::gpt-5.4-mini"
+    },
+    "unspecified-high": {
+      "model": "QGenie/anthropic::claude-4-5-opus:thinking"
+    },
+    "writing": {
+      "model": "QGenie/anthropic::claude-4-6-sonnet"
+    }
+  }
+}

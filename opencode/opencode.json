@@ -1,19 +1,173 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "file://{env:HOME}/workspace/opencode-qgenie-provider/dist/plugin.js"
+    "file://{env:HOME}/workspace/opencode-qgenie-provider-v2/dist/plugin.js",
+    "oh-my-openagent@latest"
   ],
   "provider": {
-    "qgenie": {
+    "QGenie": {
       "name": "QGenie",
-      "npm": "file://{env:HOME}/workspace/opencode-qgenie-provider",
-     "models": {
+      "npm": "file://{env:HOME}/workspace/opencode-qgenie-provider-v2",
+      "models": {
         "anthropic::claude-4-5-opus": {
-          "name": "Claude 4.5 Opus"
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "anthropic::claude-4-5-opus:thinking": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "azure::gpt-5.1": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "azure::gpt-5.1-codex": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "azure::gpt-5.1-codex-max": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "azure::gpt-5.2": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "azure::gpt-5.2-codex": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "azure::gpt-5.3-codex": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "azure::gpt-5.4": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "azure::gpt-5.4-mini": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "vertexai::gemini-3-flash-preview": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "vertexai::gemini-3.1-pro-preview": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            }
+          }
         }
       },
       "options": {
-        "baseURL": "https://qpilot-api.qualcomm.com/v1"
+        "litellmProxy": true
       }
     }
   },
@@ -23,5 +177,7 @@
     "webfetch": "ask",
     "websearch": "ask"
   },
-  "enabled_providers": ["qgenie"]
+  "enabled_providers": [
+    "QGenie"
+  ]
 }
