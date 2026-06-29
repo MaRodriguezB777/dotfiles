@@ -1,0 +1,11 @@
+[Unit]
+Description=Run QGenie telemetry daemon hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=3600s
+Unit=qgenie-daemon.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -13,3 +13,9 @@ map("n", "<leader>gd", "<cmd>DiffviewOpen HEAD -- %<cr>", { desc = "Diffview: op
 map("n", "<leader>gD", "<cmd>DiffviewClose<cr>", { desc = "Diffview: close" })
 -- map("n", "<leader>gh", "<cmd>DiffviewFileHistory<cr>", { desc = "Diffview: file history" })
 -- map("n", "<leader>gH", "<cmd>DiffviewFileHistory %<cr>", { desc = "Diffview: current file history" })
+
+-- Word Wrap --
+map("n", "<M-z>", function ()
+  vim.wo.wrap = not vim.wo.wrap
+end, { desc = "Toggle word wrap" })
+map("n", "<M-Z>", require("wrapping-paper").wrap_line, { desc = "fake wrap current line" })

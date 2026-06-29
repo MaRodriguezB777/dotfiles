@@ -1,0 +1,6 @@
+[Unit]
+Description=QGenie telemetry daemon
+
+[Service]
+Type=oneshot
+ExecStart="/local/mnt/workspace/manurodr/.local/bin/qgenie" daemon run-once --reason heartbeat
