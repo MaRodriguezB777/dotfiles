@@ -19,3 +19,19 @@ map("n", "<M-z>", function ()
   vim.wo.wrap = not vim.wo.wrap
 end, { desc = "Toggle word wrap" })
 map("n", "<M-Z>", require("wrapping-paper").wrap_line, { desc = "fake wrap current line" })
+
+-- Toggle `\n` in actual newlines --
+local newline_expanded = {}
+map('n', '<leader>wn', function()
+  local bufnr = vim.api.nvim_get_current_buf()
+
+  if not newline_expanded[bufnr] then
+    vim.cmd([[%s/\\n/\r/ge]])
+    newline_expanded[bufnr] = true
+    print("\\n → newlines")
+  else
+    vim.cmd([[%s/\n/\\n/ge]])
+    newline_expanded[bufnr] = false
+    print("newlines → \\n")
+  end
+end, { desc = "Toggle \\n ↔ newlines" })

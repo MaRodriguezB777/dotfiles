@@ -28,3 +28,5 @@ vim.env.NVIM_LISTEN_ADDRESS = vim.v.servername
 
 vim.opt.linebreak = True -- Wrap lines at a character in 'breakat' (spaces, punctuation)
 vim.opt.breakindent = True -- Maintain indentation levels for wrapped lines
+
+vim.opt.showcmd = true -- Show token counts
