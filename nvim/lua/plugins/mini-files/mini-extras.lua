@@ -98,6 +98,11 @@ end
 
 function M.setup()
   local MiniFiles = require("mini.files")
+  MiniFiles.setup({
+    mappings = {
+      synchronize = "<C-s>"
+    },
+  })
 
   -- Global open keymaps
   local open_buf_file = function(buf)
@@ -205,6 +210,12 @@ function M.setup()
           vim.api.nvim_set_current_dir(entry.path)
         end
       end, {noremap = true, silent = true, desc = "[Custom] set CWD as current directory level"})
+
+      -- Synchronize (save) from insert mode
+      buf_map("i", "<C-s>", function()
+        vim.cmd("stopinsert")
+        MiniFiles.synchronize()
+      end, { desc = "Synchronize" })
     end,
   })
 
