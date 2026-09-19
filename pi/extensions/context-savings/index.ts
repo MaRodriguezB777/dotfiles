@@ -94,6 +94,24 @@ const TRIM_MIN_TOKENS = 16; // don't bother replacing tiny outputs
 const DISABLED = process.env["CONTEXT_SAVINGS_DISABLED"] === "1";
 
 /**
+ * Growing the trim edits history that has already been sent, which invalidates
+ * the provider's cached prefix from that point. That is only worth paying for
+ * when the saving is large relative to the rewrite it forces.
+ *
+ * Anthropic pricing, relative to base input: cache read 0.1x, cache write
+ * 1.25x. Invalidating a context of C tokens therefore costs ~1.15*C extra,
+ * while trimming T tokens saves 0.1*T per later request — so a growth only
+ * breaks even after ~11.5*C/T requests. With C=250k and T=10k that is ~287
+ * requests, and a per-turn sliding window re-grows long before then.
+ *
+ * These two guards make the "grow every turn" death spiral impossible
+ * regardless of how the keep-windows or TTL are configured.
+ */
+const MIN_REQUESTS_BETWEEN_GROWTH = envInt("CONTEXT_SAVINGS_MIN_REQUESTS_BETWEEN_GROWTH", 8);
+/** A growth must remove at least this fraction of the context to be worth a rewrite. */
+const MIN_GROWTH_FRACTION = 0.05;
+
+/**
  * How trimmed tokens are priced.
  *   counterfactual (default) — price them at what they *would* have cost on
  *     that request: full input rate on a genuine cache miss, cache-read rate
@@ -125,10 +143,36 @@ interface LlmMessage {
 /** The frozen trim applied to every request after a compression. */
 interface TrimSpec {
 	toolCallIds: Set<string>;
-	/** [msgIdx, blockIdx] of removed thinking blocks (positions in the context list at compression time). */
-	thinking: Array<[number, number]>;
+	/**
+	 * Identities of removed thinking blocks, NOT positions.
+	 *
+	 * This used to be [msgIdx, blockIdx] into the context list as it looked at
+	 * compression time. Any later change to the shape of that list — a
+	 * compaction replacing N messages with one summary, an extension prepending
+	 * a message, this very function dropping an emptied message — re-aims every
+	 * entry at different content. The trim then edits the wrong message (or
+	 * fails to edit the right one), which silently changes the prompt prefix and
+	 * destroys the provider cache. Keying on the block's own signature makes the
+	 * spec immune to reordering, exactly as toolCallIds already are.
+	 */
+	thinking: Set<string>;
 	/** Total estimated tokens removed by this spec (all compressions so far). */
 	cumulativeTokens: number;
+}
+
+/**
+ * Stable identity for a thinking block. Anthropic returns a `signature` for
+ * every thinking block and pi round-trips it as `thinkingSignature`; redacted
+ * blocks carry an opaque payload there instead. Fall back to a hash of the
+ * text so a block without either is still addressable rather than untrimmable.
+ */
+function thinkingKey(b: any): string {
+	const sig = typeof b?.thinkingSignature === "string" ? b.thinkingSignature : "";
+	if (sig.length > 0) return sig;
+	const text = typeof b?.thinking === "string" ? b.thinking : "";
+	let h = 5381;
+	for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+	return `h${h.toString(36)}:${text.length}`;
 }
 
 /** Snapshot persisted at each compression event (v2: running-summary design). */
@@ -141,7 +185,8 @@ interface SnapshotRecord {
 	cumulativeTokens: number;
 	deltaTokens: number;
 	toolCallIds: string[];
-	thinking: Array<[number, number]>;
+	/** v2 wrote [msgIdx, blockIdx] pairs; v3 writes stable block identities. */
+	thinking: string[];
 }
 
 interface Period {
@@ -307,13 +352,13 @@ function isMarkerMessage(m: LlmMessage): boolean {
  */
 function compressMessages(
 	messages: LlmMessage[],
-): { messages: LlmMessage[]; removedTokens: number; removedThinkingBlocks: number; removedToolOutputs: number; toolCallIds: string[]; thinking: Array<[number, number]> } | null {
+): { messages: LlmMessage[]; removedTokens: number; removedThinkingBlocks: number; removedToolOutputs: number; toolCallIds: string[]; thinking: string[] } | null {
 	let removedTokens = 0;
 	let removedThinkingBlocks = 0;
 	let removedToolOutputs = 0;
 	let changed = false;
 	const toolCallIds: string[] = [];
-	const thinking: Array<[number, number]> = [];
+	const thinking: string[] = [];
 
 	// Anthropic requires the *latest* assistant message to be unmodified —
 	// never remove thinking blocks from it.
@@ -347,7 +392,7 @@ function compressMessages(
 				removedTokens += estimateTextTokens(typeof b.thinking === "string" ? b.thinking : "");
 				removedThinkingBlocks++;
 				changed = true;
-				thinking.push([i, j]);
+				thinking.push(thinkingKey(b));
 			}
 		}
 	}
@@ -446,19 +491,29 @@ function projectTrim(messages: LlmMessage[]): { tokens: number; toolOutputs: num
  * Apply a frozen TrimSpec to the current context. Returns the modified list,
  * or null when nothing needed trimming (all references already absent).
  */
-function applySpec(messages: LlmMessage[], spec: TrimSpec): LlmMessage[] | null {
-	if (spec.toolCallIds.size === 0 && spec.thinking.length === 0) return null;
+/**
+ * Apply a frozen spec by IDENTITY.
+ *
+ * Returns `matched`: how many of the spec's targets were actually found in
+ * this context. The caller needs that to tell two very different situations
+ * apart, which the old boolean `changed` conflated:
+ *
+ *   matched > 0, changed false — already in the trimmed shape. Re-sending it
+ *     unchanged is correct and keeps the prefix stable (idempotent).
+ *   matched === 0 — the spec addresses turns this context no longer contains
+ *     (a compaction summarised them away). Falling through to the untrimmed
+ *     context here is what silently rewrote the prefix mid-session.
+ */
+function applySpec(
+	messages: LlmMessage[],
+	spec: TrimSpec,
+): { messages: LlmMessage[]; matched: number; changed: boolean } {
 	let changed = false;
-	const thinkingByMsg = new Map<number, Set<number>>();
-	for (const [mi, bi] of spec.thinking) {
-		const set = thinkingByMsg.get(mi) ?? new Set<number>();
-		set.add(bi);
-		thinkingByMsg.set(mi, set);
-	}
+	let matched = 0;
 	const out: LlmMessage[] = [];
-	for (let i = 0; i < messages.length; i++) {
-		const m = messages[i];
+	for (const m of messages) {
 		if (m?.role === "toolResult" && typeof m.toolCallId === "string" && spec.toolCallIds.has(m.toolCallId)) {
+			matched++;
 			if (!isMarkerMessage(m)) {
 				out.push({ ...m, content: [{ type: "text", text: TOOL_OUTPUT_MARKER }] });
 				changed = true;
@@ -467,20 +522,24 @@ function applySpec(messages: LlmMessage[], spec: TrimSpec): LlmMessage[] | null 
 			}
 			continue;
 		}
-		const drop = thinkingByMsg.get(i);
-		if (m?.role === "assistant" && Array.isArray(m.content) && drop?.size) {
-			const content = (m.content as ContentBlock[]).filter((_, j) => !drop.has(j));
-			if (content.length === 0) {
+		if (m?.role === "assistant" && Array.isArray(m.content) && spec.thinking.size > 0) {
+			const blocks = m.content as ContentBlock[];
+			const keep = blocks.filter((b: any) => {
+				if (b?.type !== "thinking") return true;
+				if (!spec.thinking.has(thinkingKey(b))) return true;
+				matched++;
+				return false;
+			});
+			if (keep.length !== blocks.length) {
 				changed = true;
-				continue; // drop emptied message
+				if (keep.length === 0) continue; // thinking-only message: drop entirely
+				out.push({ ...m, content: keep });
+				continue;
 			}
-			out.push({ ...m, content });
-			changed = true;
-			continue;
 		}
 		out.push(m);
 	}
-	return changed ? out : null;
+	return { messages: out, matched, changed };
 }
 
 // ---------------------------------------------------------------------------
@@ -522,7 +581,14 @@ function walkBranch(branch: any[]): WalkResult {
 			const d = e.data;
 			spec = {
 				toolCallIds: new Set(Array.isArray(d.toolCallIds) ? d.toolCallIds : []),
-				thinking: Array.isArray(d.thinking) ? d.thinking : [],
+				// v2 snapshots stored [msgIdx, blockIdx] pairs. Those positions cannot
+				// be resolved against a context that has since changed shape, and
+				// guessing would edit the wrong message, so only string identities
+				// (v3) are restored. A stale v2 snapshot simply contributes no
+				// thinking trim, which is the safe direction.
+				thinking: new Set(
+					(Array.isArray(d.thinking) ? d.thinking : []).filter((x: unknown): x is string => typeof x === "string"),
+				),
 				cumulativeTokens: typeof d.cumulativeTokens === "number" ? d.cumulativeTokens : 0,
 			};
 			// A manual /compress may well have hit a warm cache; every other
@@ -603,6 +669,80 @@ export default function (pi: ExtensionAPI) {
 	let lastProjection = { tokens: 0, toolOutputs: 0, thinkingBlocks: 0 };
 	let lastUsage: any = null;
 
+	// --- prefix-stability bookkeeping (fix 2) + diagnostics (fix 5) ---------
+	/** Per-message fingerprints of the last context we actually sent. */
+	let lastSentPrefix: string[] = [];
+	/** Requests since the last compression, used to rate-limit trim growth. */
+	let requestsSinceCompression = Number.POSITIVE_INFINITY;
+	let prefixBreaks = 0;
+	const diagnostics: string[] = [];
+
+	/**
+	 * Record something that must not be swallowed. The original code wrapped the
+	 * snapshot write in a bare `catch {}`; after a session replacement
+	 * pi.appendEntry throws "stale ctx", so every compression after a /reload
+	 * left no trace at all — which is precisely why this class of bug survived
+	 * for days of sessions without showing up in any log.
+	 */
+	function diag(msg: string): void {
+		const line = `[context-savings] ${new Date().toISOString()} ${msg}`;
+		diagnostics.push(line);
+		if (diagnostics.length > 200) diagnostics.shift();
+		try {
+			process.stderr.write(`${line}\n`);
+		} catch {
+			/* stderr closed: the in-memory ring above still holds it for /savings */
+		}
+	}
+
+	/** Cheap per-message fingerprint; only used to compare consecutive requests. */
+	function fingerprint(messages: LlmMessage[]): string[] {
+		return messages.map((m) => {
+			const s = `${m?.role}:${JSON.stringify(m?.content ?? "")}`;
+			let h = 5381;
+			for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+			return `${h.toString(36)}:${s.length}`;
+		});
+	}
+
+	/**
+	 * The one invariant this extension must never break: consecutive requests may
+	 * differ only by appended messages. Anything else rewrites the provider's
+	 * cached prefix from the point of difference. Nothing checked this before,
+	 * which is how a per-turn history edit went unnoticed.
+	 *
+	 * `expectReset` is true when the cache is already dead (compaction, model
+	 * switch, long idle), where a changed prefix costs nothing.
+	 */
+	function verifyPrefix(outgoing: LlmMessage[], expectReset: boolean): void {
+		const next = fingerprint(outgoing);
+		if (!expectReset && lastSentPrefix.length > 0) {
+			const n = Math.min(lastSentPrefix.length, next.length);
+			let diverge = -1;
+			for (let i = 0; i < n; i++) {
+				if (lastSentPrefix[i] !== next[i]) {
+					diverge = i;
+					break;
+				}
+			}
+			if (diverge >= 0) {
+				prefixBreaks++;
+				diag(
+					`PREFIX BROKEN at message ${diverge}/${lastSentPrefix.length} on a warm cache — ` +
+						`everything from there is re-billed at write price.`,
+				);
+				// Deliberately does NOT touch `spec`. A detector must not change
+				// behaviour: dropping the trim here would throw away a correct,
+				// sticky spec on any false positive (a genuinely new conversation,
+				// a branch switch) and send the whole context untrimmed — the exact
+				// failure it is meant to report. Oscillation is prevented upstream,
+				// by the growth gate and by resetting only when the spec matches
+				// nothing at all.
+			}
+		}
+		lastSentPrefix = next;
+	}
+
 	/**
 	 * Re-derive all tracking state from the current session branch.
 	 * Used on session start (startup/resume/fork) and after /tree navigation.
@@ -657,6 +797,13 @@ export default function (pi: ExtensionAPI) {
 		// would in fact rewrite the whole prefix.
 		lastSentLevel = spec !== null && walk.requestsAfterFirst > 0 ? spec.cumulativeTokens : 0;
 		lastUsage = lastBilled;
+		// The provider's cached prefix belongs to the previous process; we have not
+		// sent anything yet, so there is nothing to compare the next request
+		// against. Claiming otherwise would make verifyPrefix report a phantom
+		// break on the first request after every resume.
+		lastSentPrefix = [];
+		// Growth is rate-limited per run; a fresh run starts eligible.
+		requestsSinceCompression = Number.POSITIVE_INFINITY;
 	}
 
 	// -------------------------------------------------------------------------
@@ -697,10 +844,15 @@ export default function (pi: ExtensionAPI) {
 		lastCompactionSummaryCount = compactionCount;
 		contextRebuiltSinceLastRequest = false;
 
-		// A rebuild (compaction) changes message positions, so the frozen trim
-		// would point at the wrong blocks. Drop it; a fresh compression below
-		// recomputes it (a rebuild is a definite cache miss anyway).
+		// A rebuild (compaction) replaces whole runs of messages. The spec is now
+		// identity-keyed so it survives reordering, but the turns it references may
+		// genuinely be gone; a fresh compression below recomputes it, and a rebuild
+		// is a definite cache miss anyway.
 		if (rebuilt) spec = null;
+
+		// The cache is already dead on any of these, so a changed prefix is free.
+		const cacheAlreadyCold = reason !== null;
+		requestsSinceCompression++;
 
 		if (!enabled) {
 			// Toggled off: send the untouched context, but keep `spec` so toggling
@@ -713,48 +865,82 @@ export default function (pi: ExtensionAPI) {
 		const shouldCompress = manual || (reason !== null && !DISABLED && !(MIN_CONTEXT_TOKENS > 0 && totalTokens < MIN_CONTEXT_TOKENS));
 
 		if (shouldCompress) {
-			// Window recomputation is a superset of the frozen trim, so this
-			// safely replaces the spec (the trim can only grow here).
 			const result = compressMessages(messages);
 			if (result) {
 				const prevCum = spec?.cumulativeTokens ?? 0;
-				spec = {
-					toolCallIds: new Set(result.toolCallIds),
-					thinking: result.thinking,
-					cumulativeTokens: result.removedTokens,
-				};
-				const snapshot: SnapshotRecord = {
-					v: 2,
-					ts: now,
-					modelKey: modelKey ?? "unknown",
-					reason: reason ?? "unknown",
-					idleMs: idleMs ?? 0,
-					cumulativeTokens: spec.cumulativeTokens,
-					deltaTokens: spec.cumulativeTokens - prevCum,
-					toolCallIds: result.toolCallIds,
-					thinking: result.thinking,
-				};
-				try {
-					pi.appendEntry(ENTRY_TYPE, snapshot);
-				} catch {
-					// Non-fatal: state lives in memory; the walk just won't see
-					// this snapshot after a restart.
+				const delta = result.removedTokens - prevCum;
+
+				// Recomputing the keep-window is a SUPERSET of the frozen trim, and
+				// the extra it catches is always older history that has already been
+				// sent untrimmed. Committing it edits the live cached prefix. That is
+				// free when the cache is already cold, and ruinous when it is warm:
+				// a fixed keep-window slides once per turn, so an unguarded grow is
+				// one full-context rewrite per turn, forever.
+				const grows = spec !== null && delta > 0;
+				const worthIt = delta >= Math.max(TRIM_MIN_TOKENS * 4, totalTokens * MIN_GROWTH_FRACTION);
+				const spacedOut = requestsSinceCompression >= MIN_REQUESTS_BETWEEN_GROWTH;
+				const allowed = manual || rebuilt || !grows || (cacheAlreadyCold && worthIt && spacedOut);
+
+				if (!allowed) {
+					diag(
+						`skipped trim growth (+${delta} tok of ${totalTokens}): ` +
+							`${requestsSinceCompression} requests since last compression, ` +
+							`warm=${!cacheAlreadyCold} — rewriting the prefix would cost more than it saves.`,
+					);
+				} else {
+					spec = {
+						toolCallIds: new Set(result.toolCallIds),
+						thinking: new Set(result.thinking),
+						cumulativeTokens: result.removedTokens,
+					};
+					const snapshot: SnapshotRecord = {
+						v: 2,
+						ts: now,
+						modelKey: modelKey ?? "unknown",
+						reason: reason ?? "unknown",
+						idleMs: idleMs ?? 0,
+						cumulativeTokens: spec.cumulativeTokens,
+						deltaTokens: delta,
+						toolCallIds: result.toolCallIds,
+						thinking: result.thinking,
+					};
+					try {
+						pi.appendEntry(ENTRY_TYPE, snapshot);
+					} catch (err) {
+						// Must never be silent: pi.appendEntry throws "stale ctx" after a
+						// session replacement, so swallowing this hid every compression
+						// that happened after a /reload. State still lives in memory; the
+						// branch walk just won't see it after a restart.
+						diag(`snapshot NOT persisted (${String(err)}); /savings will under-report after a restart.`);
+					}
+					requestsSinceCompression = 0;
+					pending = { reason: reason ?? "unknown" };
+					lastSentLevel = spec.cumulativeTokens;
+					verifyPrefix(result.messages, true); // compression always resets the prefix
+					return { messages: result.messages };
 				}
-				pending = { reason: reason ?? "unknown" };
-				lastSentLevel = spec.cumulativeTokens;
-				return { messages: result.messages };
 			}
 		}
 
 		// Sticky: apply the frozen trim to this request too.
-		if (spec) {
+		if (spec && (spec.toolCallIds.size > 0 || spec.thinking.size > 0)) {
 			const applied = applySpec(messages, spec);
-			if (applied) {
+			if (applied.matched > 0) {
+				// Found its targets. Re-send the same shape even when nothing needed
+				// changing this time: identical output is exactly what keeps the
+				// prefix stable.
 				lastSentLevel = spec.cumulativeTokens;
-				return { messages: applied };
+				verifyPrefix(applied.messages, cacheAlreadyCold);
+				return { messages: applied.messages };
 			}
+			// Nothing the spec references exists any more. Silently sending the
+			// untrimmed context here is what used to flip the prefix mid-session;
+			// drop the spec deliberately so the reset is recorded and happens once.
+			diag(`trim spec no longer matches this context (0 targets found) — resetting baseline.`);
+			spec = null;
 		}
 		lastSentLevel = 0;
+		verifyPrefix(messages, cacheAlreadyCold);
 		return;
 	});
 
@@ -819,9 +1005,18 @@ export default function (pi: ExtensionAPI) {
 	// -------------------------------------------------------------------------
 
 	pi.registerCommand("savings", {
-		description: "Show tokens & cost saved by context-savings compression (add 'detail' for the per-period breakdown)",
+		description: "Show tokens & cost saved by context-savings compression ('detail' for per-period, 'diag' for cache diagnostics)",
 		handler: async (args, ctx) => {
 			const walk = walkBranch(ctx.sessionManager.getBranch() ?? []);
+			if (args?.trim() === "diag") {
+				ctx.ui.notify(
+					diagnostics.length === 0
+						? "context-savings: no diagnostics recorded (no skipped growths, spec resets or prefix breaks)."
+						: `${prefixBreaks} warm-cache prefix break(s) this run\n${diagnostics.slice(-20).join("\n")}`,
+					prefixBreaks > 0 ? "warning" : "info",
+				);
+				return;
+			}
 			if (walk.compressions === 0) {
 				ctx.ui.notify(`No context compressions in this session yet — /compress to start.`, "info");
 				return;
