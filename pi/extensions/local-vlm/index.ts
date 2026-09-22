@@ -1,7 +1,10 @@
 /**
  * local-vlm — pi extension for the local_llm llama.cpp stack.
  *
- *   /start-local-server <user>/<model> [quant]   start the server on a model
+ *   /start-local-server                          start the server in ROUTER mode,
+ *                                                serving every installed model
+ *   /start-local-server <user>/<model> [quant]   same, fetching that model first
+ *   /start-local-server single <model> [quant]   pin one model (old behaviour)
  *   local_vlm_query                              tool: ask the local VLM about
  *                                                text / images / a video
  *
@@ -86,7 +89,7 @@ async function listModels(signal?: AbortSignal): Promise<ModelStatus[]> {
   } catch (err) {
     throw new Error(
       `Local LLM server is not reachable at ${baseUrl()}.\n` +
-        `Start it with:  /start-local-server <user>/<model> [quant]\n` +
+        `Start it with:  /start-local-server   (router mode, serves every installed model)\n` +
         `(underlying error: ${(err as Error).message})`,
     );
   }
@@ -495,9 +498,22 @@ async function toDataUrl(path: string): Promise<ChatContent> {
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("start-local-server", {
     description:
-      "Start the local llama.cpp server on a HuggingFace model: <user>/<model> [quant]",
+      "Start the local llama.cpp server in router mode (all installed models); " +
+      "optional <user>/<model> [quant] is downloaded first. 'single <model>' pins one model",
     handler: async (args, ctx) => {
-      let [repo, quant] = args.trim().split(/\s+/).filter(Boolean);
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      // Router mode is the default: it serves every installed model and loads
+      // them on demand, which is what pi's own llama.cpp provider requires
+      // (/login llama.cpp rejects a single-model server with "Server is not
+      // running in llama.cpp router mode"). "single" opts back out.
+      let router = true;
+      if (/^(--)?single$/.test(tokens[0] ?? "")) {
+        router = false;
+        tokens.shift();
+      } else if (/^(--)?router$/.test(tokens[0] ?? "")) {
+        tokens.shift();
+      }
+      let [repo, quant] = tokens;
 
       if (!existsSync(SERVE_SCRIPT)) {
         ctx.ui.notify(
@@ -507,11 +523,13 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // No model given: offer what is already on disk.
-      if (!repo) {
+      // No model given: in router mode that is the normal case — everything on
+      // disk is served, so there is nothing to choose. Single-model mode still
+      // needs a pick, so offer what is already installed.
+      if (!repo && !router) {
         if (!ctx.hasUI) {
           ctx.ui.notify(
-            "Usage: /start-local-server <user>/<model> [quant]",
+            "Usage: /start-local-server single <user>/<model> [quant]",
             "error",
           );
           return;
@@ -530,7 +548,7 @@ export default function (pi: ExtensionAPI) {
         if (inv.models.length === 0) {
           ctx.ui.notify(
             `No models in ${inv.modelsDir}. Pass a HuggingFace repo: ` +
-              `/start-local-server <user>/<model> [quant]`,
+              `/start-local-server single <user>/<model> [quant]`,
             "error",
           );
           return;
@@ -559,54 +577,60 @@ export default function (pi: ExtensionAPI) {
         quant = undefined;
       }
 
-      const quoted = quoteArgs(repo, quant);
+      // A model argument still resolves (and downloads) exactly as before; in
+      // router mode it is then served by the router along with everything else.
+      let plan:
+        | {
+            repo: string;
+            model: string;
+            mmproj: string | null;
+            modelBytes: number;
+            missingBytes: number;
+            installed: boolean;
+            modelsDir: string;
+          }
+        | null = null;
+      const quoted = repo ? quoteArgs(repo, quant) : "";
 
-      ctx.ui.setStatus("local-vlm", `resolving ${repo}...`);
-      let plan: {
-        repo: string;
-        model: string;
-        mmproj: string | null;
-        modelBytes: number;
-        missingBytes: number;
-        installed: boolean;
-        modelsDir: string;
-      };
-      try {
-        const planRun = await pi.exec("bash", ["-c", `PLAN=1 ${quoted}`], {
-          timeout: 60_000,
-        });
-        if ((planRun.code ?? 0) !== 0) {
+      if (repo) {
+        ctx.ui.setStatus("local-vlm", `resolving ${repo}...`);
+        try {
+          const planRun = await pi.exec("bash", ["-c", `PLAN=1 ${quoted}`], {
+            timeout: 60_000,
+          });
+          if ((planRun.code ?? 0) !== 0) {
+            ctx.ui.setStatus("local-vlm", undefined);
+            ctx.ui.notify(
+              `Could not resolve model:\n${planRun.stderr || planRun.stdout}`,
+              "error",
+            );
+            return;
+          }
+          const jsonStart = planRun.stdout.indexOf("{");
+          if (jsonStart < 0) throw new Error(planRun.stdout || planRun.stderr);
+          plan = JSON.parse(planRun.stdout.slice(jsonStart));
+        } catch (err) {
           ctx.ui.setStatus("local-vlm", undefined);
           ctx.ui.notify(
-            `Could not resolve model:\n${planRun.stderr || planRun.stdout}`,
+            `Failed to resolve ${repo}: ${(err as Error).message}`,
             "error",
           );
           return;
         }
-        const jsonStart = planRun.stdout.indexOf("{");
-        if (jsonStart < 0) throw new Error(planRun.stdout || planRun.stderr);
-        plan = JSON.parse(planRun.stdout.slice(jsonStart));
-      } catch (err) {
         ctx.ui.setStatus("local-vlm", undefined);
-        ctx.ui.notify(
-          `Failed to resolve ${repo}: ${(err as Error).message}`,
-          "error",
-        );
-        return;
-      }
-      ctx.ui.setStatus("local-vlm", undefined);
 
-      if (!plan.installed) {
-        const gb = (plan.missingBytes / 1e9).toFixed(1);
-        const ok = await ctx.ui.confirm(
-          "Model not installed",
-          `${plan.repo}\n  file   : ${plan.model}\n` +
-            (plan.mmproj ? `  mmproj : ${plan.mmproj}\n` : "") +
-            `\nDownload ${gb} GB to ${plan.modelsDir}?`,
-        );
-        if (!ok) {
-          ctx.ui.notify("Aborted; server not started.", "warning");
-          return;
+        if (plan && !plan.installed) {
+          const gb = (plan.missingBytes / 1e9).toFixed(1);
+          const ok = await ctx.ui.confirm(
+            "Model not installed",
+            `${plan.repo}\n  file   : ${plan.model}\n` +
+              (plan.mmproj ? `  mmproj : ${plan.mmproj}\n` : "") +
+              `\nDownload ${gb} GB to ${plan.modelsDir}?`,
+          );
+          if (!ok) {
+            ctx.ui.notify("Aborted; server not started.", "warning");
+            return;
+          }
         }
       }
 
@@ -618,17 +642,23 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      const label = router
+        ? plan
+          ? `router (+ ${plan.model})`
+          : "router (all installed models)"
+        : (plan?.model ?? repo);
+
       // Start WITHOUT awaiting. Waiting here blocks the whole TUI for as long
       // as the model takes to load (minutes for a 27B), which looks like pi
       // has frozen. DETACH=1 returns as soon as the container is up; readiness
       // is then polled in the background and reported when it resolves.
       startInFlight = true;
       serverState = "starting";
-      serverDetail = plan.model;
+      serverDetail = label;
       clearPoll();
-      ctx.ui.setStatus("local-vlm", `starting ${plan.model}...`);
+      ctx.ui.setStatus("local-vlm", `starting ${label}...`);
       ctx.ui.notify(
-        `Starting ${plan.model}… you can keep working; ` +
+        `Starting ${label}… you can keep working; ` +
           `/local-server-status shows progress.`,
         "info",
       );
@@ -641,29 +671,52 @@ export default function (pi: ExtensionAPI) {
         startInFlight = false;
         ctx.ui.setStatus("local-vlm", undefined);
         serverState = ok ? "ready" : "error";
-        serverDetail = ok ? plan.model : headline;
+        serverDetail = ok ? label : headline;
         ctx.ui.notify(`${headline}\n${detail}`, ok ? "info" : "error");
         // Durable record in the transcript; notifications are transient.
         pi.appendEntry("local-vlm-start", {
           ok,
           headline,
           detail,
-          model: plan.model,
-          mmproj: plan.mmproj,
+          model: label,
+          mmproj: plan?.mmproj ?? null,
         });
       };
 
       void (async () => {
         try {
+          // ROUTER=1 short-circuits serve_model.sh before it looks at a model
+          // argument, so a requested model is fetched in a separate NO_START
+          // pass first; the router then picks it up from disk.
+          if (router && quoted) {
+            const dl = await pi.exec(
+              "bash",
+              ["-c", `YES=1 NO_START=1 ${quoted}`],
+              { timeout: 30 * 60_000 },
+            );
+            if ((dl.code ?? 0) !== 0) {
+              finish(
+                false,
+                `Failed to fetch ${plan?.model ?? repo}`,
+                (dl.stderr || dl.stdout).trim().slice(-1200) ||
+                  "no output from serve_model.sh",
+              );
+              return;
+            }
+          }
+
+          const cmd = router
+            ? `ROUTER=1 YES=1 DETACH=1 ${JSON.stringify(SERVE_SCRIPT)}`
+            : `YES=1 DETACH=1 SINGLE=1 ${quoted}`;
           const start = await pi.exec(
             "bash",
-            ["-c", `YES=1 DETACH=1 ${quoted}`],
+            ["-c", cmd],
             { timeout: 30 * 60_000 }, // a cold download can be long; never infinite
           );
           if ((start.code ?? 0) !== 0) {
             finish(
               false,
-              `Failed to start ${plan.model}`,
+              `Failed to start ${label}`,
               (start.stderr || start.stdout).trim().slice(-1200) ||
                 "no output from serve_model.sh",
             );
@@ -671,6 +724,8 @@ export default function (pi: ExtensionAPI) {
           }
 
           // Container is up; wait for the model to actually become resident.
+          // In router mode "idle" is the expected steady state: every model is
+          // registered and loads on its first request.
           const deadline = Date.now() + 10 * 60_000;
           for (;;) {
             await new Promise<void>((r) => {
@@ -682,9 +737,15 @@ export default function (pi: ExtensionAPI) {
               finish(
                 true,
                 `Local server ready on ${baseUrl()}`,
-                `model  : ${plan.model}\n` +
-                  `mmproj : ${plan.mmproj ?? "none (text only)"}\n` +
-                  `loaded : ${state === "ready" ? detail : "registered, loads on first request"}`,
+                (router
+                  ? `mode   : router (models load on demand)\n` +
+                    `models : ${detail}\n`
+                  : `model  : ${plan?.model ?? repo}\n` +
+                    `mmproj : ${plan?.mmproj ?? "none (text only)"}\n`) +
+                  `loaded : ${state === "ready" ? detail : "registered, loads on first request"}` +
+                  (router
+                    ? `\nIn pi  : /login llama.cpp -> ${baseUrl()}, then /llama`
+                    : ""),
               );
               return;
             }
@@ -692,7 +753,7 @@ export default function (pi: ExtensionAPI) {
               const c = await containerState(pi).catch(() => null);
               finish(
                 false,
-                `${plan.model} failed to load`,
+                `${label} failed to load`,
                 (c?.logTail ?? detail).split("\n").slice(-12).join("\n"),
               );
               return;
@@ -700,15 +761,15 @@ export default function (pi: ExtensionAPI) {
             if (Date.now() > deadline) {
               finish(
                 false,
-                `Timed out waiting for ${plan.model}`,
+                `Timed out waiting for ${label}`,
                 `Server did not become ready within 10 minutes (state: ${state}).`,
               );
               return;
             }
-            ctx.ui.setStatus("local-vlm", `loading ${plan.model}... (${state})`);
+            ctx.ui.setStatus("local-vlm", `loading ${label}... (${state})`);
           }
         } catch (err) {
-          finish(false, `Error starting ${plan.model}`, (err as Error).message);
+          finish(false, `Error starting ${label}`, (err as Error).message);
         } finally {
           clearPoll();
         }
@@ -816,7 +877,7 @@ export default function (pi: ExtensionAPI) {
             "",
             "WARNING: a projector is exposed as its own model, which means the server",
             "is in router mode and the real model has NO vision. Restart via",
-            "/start-local-server so it is attached with --mmproj.",
+            "/start-local-server single <model> so it is attached with --mmproj.",
           );
         }
       } else {
@@ -1110,7 +1171,7 @@ export default function (pi: ExtensionAPI) {
       if (/mmproj/i.test(model.id)) {
         throw new Error(
           `The server is exposing the projector "${model.id}" as a model. ` +
-            `Restart with /start-local-server so it is attached via --mmproj instead.`,
+            `Restart with /start-local-server single <model> so it is attached via --mmproj.`,
         );
       }
 

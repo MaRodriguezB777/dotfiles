@@ -29,19 +29,12 @@ export const SPAWN_SPEC: ToolSpec = {
 	name: "subagent_spawn",
 	label: "Spawn subagent",
 	description:
-		"Start an independent pi session on a scoped task and return immediately with a handle. " +
-		"The child has its own context window; none of its intermediate work reaches yours.\n\n" +
-		"Give the child an objective, an output format, and explicit boundaries — a vague task " +
-		"produces duplicated or misaimed work.\n\n" +
-		"`writes` declares the territory the child may modify, as directory globs " +
-		'(e.g. ["src/auth/**"]), not file lists. Omit it for a read-only child. Two running ' +
-		"children may never claim overlapping territory; an overlapping spawn is refused before " +
-		"any work is done.\n\n" +
-		"Scale effort to complexity: most tasks need zero subagents. Fan out reads freely; " +
-		"prefer ONE writer. If two writers would need the same files, that is a signal to merge " +
-		"them into one child, not to spawn both.\n\n" +
-		"If a finished child already understands the code involved, use subagent_followup " +
-		"instead — a fresh child would have to rediscover everything it already knows.",
+		"Run a scoped task in an independent pi session; returns a handle at once. The child has " +
+		"its own context window, so none of its intermediate work reaches yours.\n\n" +
+		"Give it an objective, an output format, and boundaries — vague tasks produce misaimed work.\n\n" +
+		"Most tasks need no subagent. Fan out reads freely; prefer ONE writer — two writers wanting " +
+		"the same files should be merged into one child. If a finished child already knows this " +
+		"code, subagent_followup is cheaper.",
 	promptSnippet: "Start a background subagent on a scoped task and return a handle",
 	promptGuidelines: [
 		"Use subagent_spawn for work whose intermediate output you do not need to see — broad searches, isolated implementation, verification runs.",
@@ -53,7 +46,9 @@ export const SPAWN_SPEC: ToolSpec = {
 		task: Type.String({ description: "Objective, output format, and boundaries" }),
 		writes: Type.Optional(
 			Type.Array(Type.String(), {
-				description: "Write claim as globs relative to repo root. Omit for a read-only child.",
+				description:
+					"Write claim as directory globs relative to repo root, not file lists. Omit for a " +
+					"read-only child. Two running children may not overlap; an overlapping spawn is refused.",
 			}),
 		),
 		reads: Type.Optional(Type.Array(Type.String(), { description: "Advisory: areas this child will read" })),
@@ -98,19 +93,11 @@ export const FOLLOWUP_SPEC: ToolSpec = {
 	name: "subagent_followup",
 	label: "Follow up with subagent",
 	description:
-		"Send a further request to a subagent that has already finished, resuming its existing " +
-		"session so it keeps everything it learned the first time.\n\n" +
-		"Prefer this over subagent_spawn whenever the work continues something a child already " +
-		"did: fixing its own mistake, extending its change, answering a question about what it " +
-		"found, or reacting to review feedback. A fresh child starts from zero and must " +
-		"rediscover the same files, which usually costs far more than the warm child's retained " +
-		"context.\n\n" +
-		"Use subagent_spawn instead when the new work is genuinely unrelated — a warm child " +
-		"carrying irrelevant history is worse than a clean one.\n\n" +
-		"The child must have finished; collect it first if it is still running. Its write claim " +
-		"is re-acquired on resume and can be changed with `writes`, so the same conflict rules " +
-		"apply as for a new spawn. Set `compact: true` if the child ran long and you only need " +
-		"its conclusions carried forward, not its full transcript.",
+		"Continue a subagent in its existing session, keeping everything it learned.\n\n" +
+		"Prefer this over subagent_spawn whenever the work continues what that child already did — " +
+		"fixing its mistake, extending its change, answering a question about its findings. A fresh " +
+		"child must rediscover the same files. Spawn instead when the new work is unrelated.\n\n" +
+		"Its write claim is re-acquired on resume, so the same conflict rules apply as for a spawn.",
 	promptSnippet: "Send a follow-up request to a finished subagent, reusing its context",
 	promptGuidelines: [
 		"Prefer subagent_followup over a new subagent_spawn when a finished child already understands the relevant code; re-explaining context to a fresh child is usually the more expensive option.",
@@ -126,10 +113,37 @@ export const FOLLOWUP_SPEC: ToolSpec = {
 		compact: Type.Optional(
 			Type.Boolean({ description: "Summarize its history before the new turn. Default false." }),
 		),
+		interrupt: Type.Optional(
+			Type.Boolean({
+				description:
+					"Stop the child now if it is still running, then resume it with this task. " +
+					"Its work so far is kept. Default false (a running child is refused).",
+			}),
+		),
 	}),
 };
 
-export const PARENT_SPECS = [SPAWN_SPEC, PEEK_SPEC, COLLECT_SPEC, FOLLOWUP_SPEC];
+export const STOP_SPEC: ToolSpec = {
+	name: "subagent_stop",
+	label: "Stop subagent",
+	description:
+		"Stop a running subagent and release its territory. Use when it is looping, working from a " +
+		"wrong premise, or now redundant. Not destructive — its transcript and partial result are " +
+		"kept and subagent_followup can restart it. To redirect rather than end it, use " +
+		"subagent_followup({ interrupt: true }).",
+	promptSnippet: "Stop a running subagent and free its write claim",
+	promptGuidelines: [
+		"Stop a subagent as soon as you know its work is wasted; a running child keeps spending and keeps its territory locked.",
+	],
+	parameters: Type.Object({
+		id: Type.String({ description: "The subagent to stop (e.g. c-3a1f). Use 'all' to stop every running child." }),
+		reason: Type.Optional(
+			Type.String({ description: "Recorded in the run log and shown to the user." }),
+		),
+	}),
+};
+
+export const PARENT_SPECS = [SPAWN_SPEC, PEEK_SPEC, COLLECT_SPEC, FOLLOWUP_SPEC, STOP_SPEC];
 
 // ---------------------------------------------------------------------------
 // Child-side tools (registered by guard.ts, only inside a managed child)
@@ -222,49 +236,34 @@ export function collectivePreamble(claim: string[], boardRelPath: string): strin
 	const claimText = claim.length ? claim.join(", ") : "(none — you are read-only)";
 	const readOnly = claim.length === 0;
 
+	// Deliberately terse: every coordination tool already carries its own
+	// description in this child's context, so re-explaining them here is paid
+	// twice on every request. This states only what a tool description cannot --
+	// the claim, the prohibition, and when to reach for them.
 	return `---
 
-## You are one of several agents working in this repository right now
+## Other agents are editing this repository right now
 
-Other agents are editing files concurrently in this same working directory. You
-cannot see their work by reading their minds — only through the shared tools
-below. Treat them as colleagues, not obstacles.
+You see their work only through \`${boardRelPath}\` and \`notes()\` — check both
+before any non-trivial investigation; a sibling may have answered it already.
 
 **Your write claim:** ${claimText}
 
 ${
 	readOnly
-		? `You have no write claim. Every write and edit will be blocked, and that is
-intentional — your job is to investigate and report, not to change files.`
-		: `Anything outside that claim is blocked at the tool layer. That is not a bug and
-not a suggestion, and you must not route around it with bash — doing so silently
-destroys a colleague's work.`
+		? `Every write and edit is blocked by design — investigate and report, do not
+change files.`
+		: `Writes outside it are blocked at the tool layer. Never route around that with
+bash: it silently destroys a colleague's work. Use \`claim_paths\` to widen,
+\`release_paths\` the moment you finish with part of your territory, and
+\`request_edit\` for shared files nobody may write directly.`
 }
 
-**Before you start**
-- Read \`${boardRelPath}\` to see who else is running and what they own.
-- Call \`notes()\` before any non-trivial investigation. A sibling may already
-  have answered your question.
+Call \`note(text, paths)\` whenever you learn something a sibling would otherwise
+rediscover — cheap for you, expensive for them.
 
-**While you work**
-- \`note(text, paths)\` — the moment you learn something a sibling would
-  otherwise have to rediscover. Cheap for you, expensive for them. Err toward
-  noting too much.
-${
-	readOnly
-		? ""
-		: `- \`claim_paths(paths, why)\` — if you need to write outside your claim. If
-  nobody else owns it, this is granted instantly.
-- \`release_paths(paths)\` — as soon as you are finished with part of your
-  territory. A sibling may be waiting on it. Releasing early is the single most
-  useful cooperative act available to you.
-- \`request_edit(path, patch, why)\` — for shared files (lockfiles, manifests,
-  schemas) that nobody may write directly. The orchestrator applies these.
-`
-}
-**Your final message** is the only thing the orchestrator reads. Make it
-self-contained: what you changed, what you verified, what you could not do and
-why, and any path you needed but did not get.
+**Your final message is the only thing the orchestrator reads.** Make it
+self-contained: what you did, what you verified, what you could not do and why.
 `;
 }
 

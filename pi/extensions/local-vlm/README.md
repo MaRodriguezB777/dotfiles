@@ -11,7 +11,8 @@ expects at `~/projects/local_llm`. Override with `LOCAL_LLM_REPO`.
 
 | command | purpose |
 |---|---|
-| `/start-local-server [<user>/<model>] [quant]` | start a model; with no argument, shows a dropdown of installed models |
+| `/start-local-server [<user>/<model>] [quant]` | start the server in **router mode** (all installed models, loaded on demand); an optional model is downloaded first |
+| `/start-local-server single [<user>/<model>] [quant]` | pin one model instead; with no model, shows a dropdown of installed ones |
 | `/local-server-status` | report server state: `offline`, `starting`, `idle`, `ready`, `error` |
 
 `/start-local-server` returns immediately and loads in the background, so the
@@ -60,14 +61,24 @@ container into a restart loop.
 
 ## `/start-local-server [<user>/<model>] [quant]`
 
-With no arguments, shows a dropdown of models already on disk (with size, group,
-and whether vision is available) and serves the chosen one — no network access.
+Starts the stack in **router mode** (`ROUTER=1 serve_model.sh`): every installed
+model is served at once and loaded on demand, with per-model context size and
+offload settings applied from `infra/models/presets.ini`. This is the mode pi's
+built-in llama.cpp provider needs — a single-model server makes `/login
+llama.cpp` fail with *"Server is not running in llama.cpp router mode"*.
 
+With no arguments nothing is chosen and nothing is downloaded: whatever is on
+disk is what the router serves.
 
-Resolves the repo against the HuggingFace API via `serve_model.sh PLAN=1`.
-If the model is not installed it shows the download size and asks for
-confirmation in pi's UI before fetching, then starts the server and waits for
-readiness.
+```
+/start-local-server
+```
+
+With a model argument, the repo is resolved against the HuggingFace API via
+`serve_model.sh PLAN=1`; if it is not installed, the download size is shown and
+confirmed in pi's UI, fetched with `NO_START=1`, and the router then serves it
+alongside the rest. (`ROUTER=1` short-circuits the script before it reads a
+model argument, hence the separate fetch pass.)
 
 ```
 /start-local-server Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-GGUF Q4_K_M
@@ -75,6 +86,13 @@ readiness.
 
 Omit the quant when the repo has exactly one GGUF; if it has several, the
 script lists them with sizes.
+
+### `single` — one pinned model
+
+`/start-local-server single [<user>/<model>] [quant]` restores the old
+behaviour: one model served with `--model`/`--mmproj` (`SINGLE=1`). With no
+model it shows the dropdown of installed models. Useful when you want a
+projector attached by force, but pi's llama.cpp provider will not connect.
 
 ## `local_vlm_query` tool
 

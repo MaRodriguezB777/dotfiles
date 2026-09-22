@@ -3,7 +3,7 @@
 Spawn, supervise and resume child `pi` sessions from a parent session, with a
 coordination layer that keeps several agents from writing over each other.
 
-Four tools are added to the parent (~1.2k tokens of definitions, the extension
+Five tools are added to the parent (~970 tokens of definitions, the extension
 adds **nothing** to the system prompt):
 
 | tool | purpose |
@@ -11,7 +11,8 @@ adds **nothing** to the system prompt):
 | `subagent_spawn` | start a child on a scoped task, optionally with a write claim |
 | `subagent_peek` | bounded view of a child: `status` / `digest` / `tail` / `final` |
 | `subagent_collect` | wait for children and return their final results |
-| `subagent_followup` | resume a finished child in its existing session instead of re-explaining context to a fresh one |
+| `subagent_followup` | resume a child in its existing session instead of re-explaining context to a fresh one; `interrupt: true` stops a running child and redirects it |
+| `subagent_stop` | stop a running child and release its territory, keeping its transcript |
 
 ## Why territory, not files
 

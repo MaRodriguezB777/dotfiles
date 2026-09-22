@@ -42,7 +42,7 @@ import {
 	writeRegistry,
 } from "./registry.ts";
 import { launch } from "./spawn.ts";
-import { COLLECT_SPEC, FOLLOWUP_SPEC, PEEK_SPEC, SPAWN_SPEC } from "./text.ts";
+import { COLLECT_SPEC, FOLLOWUP_SPEC, PEEK_SPEC, SPAWN_SPEC, STOP_SPEC } from "./text.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentDef, ChildRecord, Escalation, LiveChild, Registry, Usage } from "./types.ts";
 
@@ -241,6 +241,73 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// Notification channels — strictly separated by who pays
 	// -----------------------------------------------------------------------
+
+	/**
+	 * Stop a running child and free its territory.
+	 *
+	 * Signals the whole process group, because pi's bash tool spawns detached
+	 * shells that outlive the agent and would keep writing to the repo. Waits
+	 * briefly for a clean exit so the child can flush its session file, then
+	 * escalates to SIGKILL.
+	 *
+	 * Deliberately NOT destructive: the transcript and any partial result stay on
+	 * disk, so subagent_followup can resume the same session afterwards. A stop
+	 * is a pause with the claim released, not a delete.
+	 */
+	async function stopChild(l: LiveChild, reason: string): Promise<void> {
+		const proc = procs.get(l.record.id);
+		if (proc) {
+			const signalGroup = (sig: NodeJS.Signals) => {
+				try {
+					if (proc.pid) process.kill(-proc.pid, sig);
+				} catch {
+					try {
+						proc.kill(sig);
+					} catch {
+						/* already gone */
+					}
+				}
+			};
+			signalGroup("SIGTERM");
+			await new Promise<void>((resolve) => {
+				if (l.settled) return resolve();
+				const timer = setTimeout(() => {
+					signalGroup("SIGKILL");
+					resolve();
+				}, 4000);
+				timer.unref?.();
+				l.onSettle.push(() => {
+					clearTimeout(timer);
+					resolve();
+				});
+			});
+		}
+		procs.delete(l.record.id);
+		l.settled = true;
+		// You asked for this stop, so a "[subagent x killed]" digest on the next turn
+		// would only report back something you already know.
+		markReported([l.record.id]);
+		// Written after the exit handler has had its say, so a stop is recorded as
+		// a stop rather than as the failure its non-zero exit code looks like.
+		l.record.state = "killed";
+		l.record.endedAt = Date.now();
+		try {
+			syncChild(l.record);
+		} catch {
+			/* registry unavailable */
+		}
+		try {
+			fs.appendFileSync(
+				path.join(runDir, "findings.jsonl"),
+				`${JSON.stringify({ kind: "stopped", child: l.record.id, text: reason, at: Date.now() })}\n`,
+			);
+		} catch {
+			/* run dir gone */
+		}
+		refreshBoard();
+		progress(l, true);
+		refreshWidget();
+	}
 
 	/**
 	 * Decide which model and thinking level a child runs on.
@@ -649,7 +716,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		...FOLLOWUP_SPEC,
-		async execute(_id, params: { id: string; task: string; writes?: string[]; compact?: boolean }) {
+		async execute(
+			_id,
+			params: { id: string; task: string; writes?: string[]; compact?: boolean; interrupt?: boolean },
+		) {
 			const l = live.get(params.id);
 			if (!l) {
 				return {
@@ -663,20 +733,29 @@ export default function (pi: ExtensionAPI) {
 					details: undefined,
 				};
 			}
+			let interrupted = false;
 			if (!l.settled) {
-				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`${params.id} is still running — a follow-up would race its current turn.\n` +
-								`Call subagent_collect({ ids: ["${params.id}"] }) first, then follow up.`,
-						},
-					],
-					isError: true,
-					details: undefined,
-				};
+				if (!params.interrupt) {
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									`${params.id} is still running — a follow-up would race its current turn.\n` +
+									`Either subagent_collect({ ids: ["${params.id}"] }) and then follow up, or ` +
+									`re-send with interrupt: true to stop it now and redirect it.`,
+							},
+						],
+						isError: true,
+						details: undefined,
+					};
+				}
+				// Stop it where it stands; the session file survives, so the resume
+				// below picks up everything it had already worked out.
+				await stopChild(l, `interrupted by follow-up: ${params.task.replace(/\s+/g, " ").slice(0, 120)}`);
+				interrupted = true;
 			}
+			void interrupted;
 			if (!l.record.sessionFile || !fs.existsSync(l.record.sessionFile)) {
 				return {
 					content: [
@@ -812,6 +891,57 @@ export default function (pi: ExtensionAPI) {
 			// and leave the digest owed.
 			if (level === "final" && l.settled) markReported([l.record.id]);
 			return { content: [{ type: "text", text: render(l, level) }], details: { id: l.record.id, level } };
+		},
+	});
+
+	pi.registerTool({
+		...STOP_SPEC,
+		async execute(_id, params: { id: string; reason?: string }) {
+			const reason = params.reason?.trim() || "stopped by the orchestrator";
+			const targets =
+				params.id === "all"
+					? [...live.values()].filter((l) => !l.settled)
+					: [live.get(params.id)].filter((l): l is LiveChild => Boolean(l));
+
+			if (params.id !== "all" && targets.length === 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Unknown subagent "${params.id}". Known: ${[...live.keys()].join(", ") || "(none)"}`,
+						},
+					],
+					isError: true,
+					details: undefined,
+				};
+			}
+			const running = targets.filter((l) => !l.settled);
+			if (running.length === 0) {
+				return {
+					content: [{ type: "text", text: `Nothing to stop — no matching subagent is running.` }],
+					details: { stopped: [] },
+				};
+			}
+			for (const l of running) await stopChild(l, reason);
+			// Its result is now whatever it managed to produce, so the model should be
+			// told where to find it rather than left assuming the work is lost.
+			const lines = running.map(
+				(l) =>
+					`${l.record.id} (${l.record.agent}) stopped after ${Math.round((Date.now() - l.startedAt) / 1000)}s` +
+					`${l.record.writes.length ? `, released owns[${l.record.writes.join(",")}]` : ""}`,
+			);
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`${lines.join("\n")}\n` +
+							`Partial work is kept. subagent_peek({ id, level: "final" }) to read what it got ` +
+							`to, or subagent_followup to restart it from where it left off.`,
+					},
+				],
+				details: { stopped: running.map((l) => l.record.id), reason },
+			};
 		},
 	});
 
