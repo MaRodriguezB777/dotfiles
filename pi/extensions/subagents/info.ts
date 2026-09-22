@@ -8,6 +8,7 @@
 import * as path from "node:path";
 import { discoverAgents } from "./agents.ts";
 import { configPath, loadConfig, resolveChildExtensions } from "./config.ts";
+import { collectFleet } from "./fleet.ts";
 import { CAP } from "./peek.ts";
 import {
 	BOARD_RULES_SAMPLE,
@@ -79,11 +80,25 @@ function fmt(label: string, text: string, kind: "prose" | "schema" = "prose"): s
 	return `${label}: ${c} chars ≈ ${tok(c, kind)} tok`;
 }
 
+/** Indented form, for reading in this report only. */
 function schemaJson(spec: ToolSpec): string {
 	try {
 		return JSON.stringify(spec.parameters, null, 2);
 	} catch {
 		return "(unserializable)";
+	}
+}
+
+/**
+ * The form that is actually billed. Costing must never use the indented version
+ * above: its whitespace is a presentation choice made by this report and is not
+ * sent to the model, so counting it inflated every schema figure here.
+ */
+function schemaWire(spec: ToolSpec): string {
+	try {
+		return JSON.stringify(spec.parameters);
+	} catch {
+		return "";
 	}
 }
 
@@ -93,7 +108,7 @@ function specBlock(spec: ToolSpec, indent = ""): { text: string; chars: number; 
 	const descChars = spec.description.length;
 	const snipChars = (spec.promptSnippet ?? "").length;
 	const guideChars = guidelines.length;
-	const schemaChars = schema.length;
+	const schemaChars = schemaWire(spec).length;
 	const nameChars = spec.name.length;
 
 	const total = nameChars + descChars + schemaChars;
@@ -509,4 +524,61 @@ function indentBlock(text: string, prefix: string): string {
 		.split("\n")
 		.map((l) => prefix + l)
 		.join("\n");
+}
+
+/**
+ * One-screen summary for the common case.
+ *
+ * The full report is several hundred lines; almost every time you run this you
+ * only want to know what the extension is costing right now. Everything here is
+ * derived from the same specs the full report walks, so the two can never
+ * disagree.
+ */
+export function buildInfoSummary(): string {
+	const cfg = loadConfig();
+	const agents = discoverAgents(process.cwd());
+	const worker = agents.get("worker") ?? [...agents.values()][0];
+
+	const specTok = (s: ToolSpec) =>
+		tok(s.name.length + s.description.length) + tok(schemaWire(s).length, "schema");
+
+	const parentTools = PARENT_SPECS.reduce((n, s) => n + specTok(s), 0);
+	const writerTools = WRITER_CHILD_SPECS.reduce((n, s) => n + specTok(s), 0);
+	const readOnlyTools = READONLY_CHILD_SPECS.reduce((n, s) => n + specTok(s), 0);
+	const writerPrompt = worker ? tok(childSystemPrompt(worker, ["src/**"], "BOARD.md").length) : 0;
+	const readOnlyPrompt = worker ? tok(childSystemPrompt(worker, [], "BOARD.md").length) : 0;
+
+	const row = (label: string, prompt: number, tools: number) =>
+		`  ${label.padEnd(22)}${String(prompt).padStart(8)}${String(tools).padStart(8)}${String(prompt + tools).padStart(8)}`;
+
+	const collectCap = tok(CAP.final);
+	const fanout = cfg.maxConcurrentWriters;
+
+	// Measured, not asserted: the strongest evidence that the bound holds is the
+	// biggest child this repo has actually run. Derived on every call so it can
+	// never go stale.
+	let biggest = "";
+	try {
+		const fleet = collectFleet(process.cwd(), null);
+		const top = fleet.reduce((a, b) => (b.tokens > (a?.tokens ?? 0) ? b : a), fleet[0]);
+		if (top?.tokens) {
+			const t = top.tokens >= 1e6 ? `${(top.tokens / 1e6).toFixed(1)}M` : `${Math.round(top.tokens / 1000)}k`;
+			biggest = `${t} tok over ${top.turns} turns`;
+		}
+	} catch {
+		/* no runs yet */
+	}
+
+	return [
+		`SUBAGENTS — token cost per request`,
+		"",
+		`  ${"agent".padEnd(22)}${"prompt".padStart(8)}${"tools".padStart(8)}${"total".padStart(8)}`,
+		row("main agent", 0, parentTools),
+		row("child (writer)", writerPrompt, writerTools),
+		row("child (read-only)", readOnlyPrompt, readOnlyTools),
+		"",
+    "",
+		`*Progressive context disclosure and background agents for productivity at token efficiency*`,
+		`/subagents-info full - see more in $EDITOR`,
+	].join("\n");
 }

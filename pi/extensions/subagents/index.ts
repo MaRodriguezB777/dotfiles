@@ -12,7 +12,9 @@
  */
 
 import type { ChildProcess } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
@@ -28,7 +30,7 @@ import {
 	renderInspector,
 	renderPlain,
 } from "./fleet.ts";
-import { buildInfoReport } from "./info.ts";
+import { buildInfoReport, buildInfoSummary } from "./info.ts";
 import { type PeekLevel, digest, render, statusLine } from "./peek.ts";
 import {
 	admit,
@@ -1390,14 +1392,42 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("subagents-info", {
-		description: "Open a full accounting of every prompt and tool this extension injects",
-		handler: async (_args, ctx) => {
+		description: "Token cost of this extension ('full' for the complete accounting in $EDITOR)",
+		handler: async (args, ctx) => {
+			// Default to the summary: the full report is several hundred lines, and
+			// opening an editor unasked is a worse default than printing 12 lines.
+			if (args?.trim() !== "full") {
+				const summary = buildInfoSummary();
+				if (ctx.mode === "tui") ctx.ui.notify(summary, "info");
+				else console.log(summary);
+				return;
+			}
 			const report = buildInfoReport(root, started ? runDir : null, started ? runId : null);
 			if (ctx.mode !== "tui") {
 				console.log(report);
 				return;
 			}
-			await ctx.ui.editor("subagents — context accounting (read-only; changes are discarded)", report);
+			// ctx.ui.editor() opens pi's in-TUI editor, which needs a second keypress
+			// (Ctrl+G) to reach $EDITOR. This is a read-only report, so go straight
+			// there: write it out and hand the file over.
+			const editor = process.env["VISUAL"] || process.env["EDITOR"];
+			if (!editor) {
+				await ctx.ui.editor("subagents — context accounting (read-only)", report);
+				return;
+			}
+			const file = path.join(os.tmpdir(), `subagents-info-${Date.now()}.md`);
+			fs.writeFileSync(file, report);
+			try {
+				// stdio inherit hands the terminal to the editor for the duration.
+				spawnSync(editor, [file], { stdio: "inherit", shell: false });
+			} catch {
+				ctx.ui.notify(`Could not launch ${editor}. Report written to ${file}`, "warning");
+				return;
+			} finally {
+				// The editor painted over the TUI; force a full repaint on the way out.
+				ctx.ui.requestRender?.();
+			}
+			fs.rmSync(file, { force: true });
 		},
 	});
 
