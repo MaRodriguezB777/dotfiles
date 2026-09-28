@@ -58,9 +58,34 @@ cumulative token count. That's enough for `/savings` to recompute the exact
 running summary by walking the session branch (snapshots + each assistant
 message's usage) — which is what it does, so the numbers stay correct across
 `/reload`, `/resume`, `/tree`, and restarts. The trim itself is a
-non-destructive per-request context transform: the session file and TUI still
-show full tool outputs and thinking blocks, and pi's own compaction is
-unaffected.
+per-request context transform that is **mirrored into the session** as
+append-only `context_edit` entries (see below); the TUI still shows full tool
+outputs and thinking blocks.
+
+### Persisted trim (compaction compatibility)
+
+pi's compaction, cut-point selection and context-size estimate read the
+session, not the outgoing request. Without help they would see every tool
+output and thinking block the extension stopped sending, so a session that
+fits the model comfortably could be impossible to compact (the summary
+request overflows). So at each `turn_end` the extension reconciles the
+session with the trim actually being sent:
+
+- trimmed tool results get a `context_edit` replacing them with the marker
+- assistant messages get their content minus the trimmed thinking blocks
+- `/compress off` appends restoring edits (a full copy of the original
+  content — pi has no way to delete an edit), `on` re-trims. Each toggle
+  therefore grows the session file; the model context never duplicates
+  anything (the latest edit per message wins)
+
+Edits are written on the turn *after* the trim changes (commands can't append
+them), so a `/compact` issued right after `/compress off` still sees the
+trimmed version — the safe direction. The `context` hook undoes the
+extension's own edits before deciding anything, so requests are
+byte-identical to the non-persisted design and the cache is unaffected.
+Thinking-only assistant messages and anything edited by someone else (pi's
+recovery omissions, other extensions) are never touched. Edits are
+branch-relative, like everything else in the session tree.
 
 ### Pricing
 
@@ -194,8 +219,8 @@ Environment variables, all optional:
 
 ## Tests
 
-`node test.mjs` in this directory runs an integration suite (76 assertions)
-against a mocked pi API: first compression, stickiness, frozen trim on grown
+`node test.mjs` in this directory runs an integration suite (89 assertions)
+against a mocked pi API: first compression, persisted context_edit mirror (on/off/idempotence/foreign edits), stickiness, frozen trim on grown
 contexts, the X×T1 + Y×T2 accounting, savings percentages, both pricing modes, compact vs `detail` output, the TTL-gap miss
 detector, model switch, post-compaction recompression, the min-context guard,
 the `/compress` toggle (including off→on cache-neutrality and window refresh),

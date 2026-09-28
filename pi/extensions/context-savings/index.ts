@@ -46,9 +46,11 @@
  * A one-line warning is shown after each compression request, e.g.
  *   Warning: tool/thinking compression enabled; trimmed 15.5k tokens (~$0.42 / 18.3%) from this request.
  *
- * Nothing in the session file is modified by the trim itself — it is a
- * non-destructive per-request context transform (the TUI still shows full
- * tool outputs and thinking blocks, and pi's own compaction is unaffected).
+ * The trim is decided per request, then mirrored into the session as
+ * append-only `context_edit` entries at each turn_end, so pi's compaction,
+ * cut point and context-size estimate see the same (trimmed) context the
+ * model does. Original entries are never modified (the TUI still shows full
+ * tool outputs and thinking); `/compress off` appends restoring edits.
  *
  * Configuration (environment variables, all optional):
  *   CONTEXT_SAVINGS_TTL_MS              cache TTL in ms; 0 (default) = auto:
@@ -543,6 +545,185 @@ function applySpec(
 }
 
 // ---------------------------------------------------------------------------
+// Persisted trim (context_edit mirror)
+// ---------------------------------------------------------------------------
+//
+// The trim itself is still decided and applied per request in the `context`
+// hook. But pi's own compaction, cut-point selection and context-size estimate
+// read the SESSION projection, not the outgoing request — so without help they
+// see every tool output and thinking block we stopped sending, and a session
+// that comfortably fits the model can be impossible to compact.
+//
+// So the trim is mirrored into the session as `context_edit` entries at each
+// `turn_end`: trimmed tool results get the marker, assistant messages get
+// their content minus the trimmed thinking blocks. Turning compression off
+// appends restoring edits (a full copy of the original content — pi has no
+// "delete edit"). The `context` hook first undoes our own edits so all of the
+// decision logic below keeps operating on the original messages and produces
+// byte-identical requests to the non-persisted design.
+//
+// Thinking-only assistant messages are never mirrored: dropping them would
+// need an omission edit, which is indistinguishable from pi's own recovery
+// omissions and cannot be undone by the context hook. They are still trimmed
+// from the outgoing request as before.
+
+/** Content of a thinking-bearing assistant message with the given thinking keys removed. */
+function withoutThinking(content: ContentBlock[], remove: Set<string>): ContentBlock[] {
+	return content.filter((b) => b?.type !== "thinking" || !remove.has(thinkingKey(b)));
+}
+
+function nonThinkingShape(content: ContentBlock[]): string {
+	return content
+		.filter((b) => b?.type !== "thinking")
+		.map((b) =>
+			b?.type === "toolCall"
+				? `toolCall:${String(b.id ?? "")}`
+				: b?.type === "text" && typeof b.text === "string"
+					? `text:${b.text.length}:${b.text.slice(0, 64)}`
+					: String(b?.type),
+		)
+		.join(",");
+}
+
+/**
+ * Does `cur` look like `raw` with zero or more thinking blocks removed (i.e. a
+ * state this extension produces)? Anything else is somebody else's edit and is
+ * left alone.
+ */
+function isOurAssistantShape(cur: unknown, raw: ContentBlock[]): cur is ContentBlock[] {
+	if (!Array.isArray(cur)) return false;
+	if (cur === raw) return true;
+	if (cur.length > raw.length) return false;
+	if (nonThinkingShape(cur as ContentBlock[]) !== nonThinkingShape(raw)) return false;
+	const rawKeys = new Set(raw.filter((b) => b?.type === "thinking").map(thinkingKey));
+	return (cur as ContentBlock[]).every((b) => b?.type !== "thinking" || rawKeys.has(thinkingKey(b)));
+}
+
+function thinkingKeysOf(content: ContentBlock[]): Set<string> {
+	return new Set(content.filter((b) => b?.type === "thinking").map(thinkingKey));
+}
+
+function sameSet(a: Set<string>, b: Set<string>): boolean {
+	if (a.size !== b.size) return false;
+	for (const x of a) if (!b.has(x)) return false;
+	return true;
+}
+
+/** Original (unedited) messages on the branch, indexed for the context hook. */
+function rawIndex(branch: any[]): { toolResults: Map<string, LlmMessage>; assistants: Map<number, LlmMessage[]>; hasEdits: boolean } {
+	const toolResults = new Map<string, LlmMessage>();
+	const assistants = new Map<number, LlmMessage[]>();
+	let hasEdits = false;
+	for (const e of branch) {
+		if (e?.type === "context_edit") hasEdits = true;
+		if (e?.type !== "message") continue;
+		const m = e.message;
+		if (m?.role === "toolResult" && typeof m.toolCallId === "string") toolResults.set(m.toolCallId, m);
+		else if (m?.role === "assistant" && typeof m.timestamp === "number") {
+			const list = assistants.get(m.timestamp) ?? [];
+			list.push(m);
+			assistants.set(m.timestamp, list);
+		}
+	}
+	return { toolResults, assistants, hasEdits };
+}
+
+/**
+ * Undo this extension's persisted edits in an outgoing context, so the trim
+ * logic sees the original messages. Returns the same array when nothing was
+ * restored.
+ */
+function restoreOwnEdits(messages: LlmMessage[], branch: any[]): LlmMessage[] {
+	const idx = rawIndex(branch);
+	if (!idx.hasEdits) return messages;
+	let out: LlmMessage[] | null = null;
+	for (let i = 0; i < messages.length; i++) {
+		const m = messages[i];
+		let restored: LlmMessage | null = null;
+		if (m?.role === "toolResult" && typeof m.toolCallId === "string" && isMarkerMessage(m)) {
+			const raw = idx.toolResults.get(m.toolCallId);
+			if (raw && !isMarkerMessage(raw)) restored = { ...m, content: raw.content };
+		} else if (m?.role === "assistant" && Array.isArray(m.content) && typeof m.timestamp === "number") {
+			const raws = idx.assistants.get(m.timestamp) ?? [];
+			for (const raw of raws) {
+				const rawContent = raw.content as ContentBlock[];
+				if (!Array.isArray(rawContent) || m.content === rawContent) continue;
+				const curThinking = (m.content as ContentBlock[]).filter((b) => b?.type === "thinking").length;
+				const rawThinking = rawContent.filter((b) => b?.type === "thinking").length;
+				if (curThinking < rawThinking && isOurAssistantShape(m.content, rawContent)) {
+					restored = { ...m, content: rawContent };
+					break;
+				}
+			}
+		}
+		if (restored) {
+			out ??= messages.slice();
+			out[i] = restored;
+		}
+	}
+	return out ?? messages;
+}
+
+interface ContextEditDraft {
+	type: "context_edit";
+	targetId: string;
+	replacement: { content: unknown } | null;
+}
+
+/**
+ * Compare the session projection with the trim the requests actually carry
+ * (`active` spec, or none when compression is off) and return the context
+ * edits that bring the projection in line. Only touches entries whose current
+ * content is either original or in a shape this extension produces.
+ */
+function reconcileEdits(contextEntries: any[], spec: TrimSpec | null): ContextEditDraft[] {
+	const drafts: ContextEditDraft[] = [];
+	for (const pe of contextEntries ?? []) {
+		const src = pe?.sourceEntry;
+		if (src?.type !== "message" || typeof src.id !== "string") continue;
+		if (!Array.isArray(pe.messages) || pe.messages.length !== 1) continue; // omitted by someone else
+		const raw = src.message as LlmMessage;
+		const cur = pe.messages[0] as LlmMessage;
+
+		if (raw?.role === "toolResult" && typeof raw.toolCallId === "string") {
+			if (isMarkerMessage(raw)) continue;
+			const want = spec !== null && spec.toolCallIds.has(raw.toolCallId);
+			const has = isMarkerMessage(cur);
+			if (want && !has) {
+				// Only trim content that is still the original; never clobber a foreign edit.
+				if (cur.content !== raw.content && JSON.stringify(cur.content) !== JSON.stringify(raw.content)) continue;
+				drafts.push({ type: "context_edit", targetId: src.id, replacement: { content: [{ type: "text", text: TOOL_OUTPUT_MARKER }] } });
+			} else if (!want && has) {
+				drafts.push({ type: "context_edit", targetId: src.id, replacement: { content: raw.content } });
+			}
+			continue;
+		}
+
+		if (raw?.role === "assistant" && Array.isArray(raw.content)) {
+			const rawContent = raw.content as ContentBlock[];
+			const rawKeys = thinkingKeysOf(rawContent);
+			if (rawKeys.size === 0) continue;
+			if (!isOurAssistantShape(cur.content, rawContent)) continue;
+			let wantRemoved = new Set<string>();
+			if (spec !== null && spec.thinking.size > 0) {
+				for (const k of rawKeys) if (spec.thinking.has(k)) wantRemoved.add(k);
+				// Thinking-only message: cannot be persisted without an omission edit.
+				if (withoutThinking(rawContent, wantRemoved).length === 0) wantRemoved = new Set();
+			}
+			const curKeys = thinkingKeysOf(cur.content as ContentBlock[]);
+			const curRemoved = new Set([...rawKeys].filter((k) => !curKeys.has(k)));
+			if (sameSet(curRemoved, wantRemoved)) continue;
+			drafts.push({
+				type: "context_edit",
+				targetId: src.id,
+				replacement: { content: wantRemoved.size === 0 ? rawContent : withoutThinking(rawContent, wantRemoved) },
+			});
+		}
+	}
+	return drafts;
+}
+
+// ---------------------------------------------------------------------------
 // Branch walk: recompute the running savings summary from session entries
 // ---------------------------------------------------------------------------
 
@@ -812,7 +993,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("context", (event, ctx) => {
 		const now = Date.now();
-		const messages = event.messages as LlmMessage[];
+		// Undo our own persisted context_edits first: everything below decides on
+		// the original messages, exactly as if the trim had never been persisted.
+		const incoming = event.messages as LlmMessage[];
+		const messages = restoreOwnEdits(incoming, ctx.sessionManager?.getBranch?.() ?? []);
+		const restoredAny = messages !== incoming;
 		const modelKey = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
 		const compactionCount = messages.reduce((n, m) => n + (m?.role === "compactionSummary" ? 1 : 0), 0);
 
@@ -858,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
 			// Toggled off: send the untouched context, but keep `spec` so toggling
 			// back on restores the identical prefix instead of recompressing.
 			lastSentLevel = 0;
-			return;
+			return restoredAny ? { messages } : undefined;
 		}
 
 		const totalTokens = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
@@ -941,7 +1126,24 @@ export default function (pi: ExtensionAPI) {
 		}
 		lastSentLevel = 0;
 		verifyPrefix(messages, cacheAlreadyCold);
-		return;
+		return restoredAny ? { messages } : undefined;
+	});
+
+	// -------------------------------------------------------------------------
+	// Persist the trim so pi's compaction / size estimate see what is sent
+	// -------------------------------------------------------------------------
+
+	pi.on("turn_end", (event: any) => {
+		const active = enabled && spec !== null && (spec.toolCallIds.size > 0 || spec.thinking.size > 0) ? spec : null;
+		let drafts: ContextEditDraft[];
+		try {
+			drafts = reconcileEdits(event?.context?.contextEntries ?? [], active);
+		} catch (err) {
+			diag(`could not reconcile persisted trim (${String(err)})`);
+			return;
+		}
+		if (drafts.length === 0) return;
+		return { entries: [...(event.entries ?? []), ...drafts] };
 	});
 
 	// -------------------------------------------------------------------------

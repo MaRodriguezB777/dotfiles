@@ -548,6 +548,103 @@ check("S14: resumed session with ISO timestamps detects the idle gap",
 	appended[appended.length - 1]?.data?.reason);
 
 // ---------------------------------------------------------------------------
+// S17: the trim is mirrored into the session as context_edits (turn_end), so
+//      pi's projection (compaction, size estimate) matches what is sent;
+//      /compress off restores, on re-trims; requests stay byte-identical
+// ---------------------------------------------------------------------------
+{
+	let eid = 0;
+	let ts = Date.now() - 60 * 60_000;
+	const entry = (message) => ({ type: "message", id: "m" + ++eid, message: { ...message, timestamp: ts++ } });
+	const uniqThink = (i) => ({ type: "thinking", thinking: "thought " + i + " ".repeat(600), thinkingSignature: "sig-" + i });
+
+	/** Raw session: 30 tool rounds + 10 text answers, all with unique signatures. */
+	function buildBranch() {
+		const b = [entry({ role: "user", content: [text("do the big task")] })];
+		for (let i = 0; i < 30; i++) {
+			b.push(entry({ role: "assistant", content: [uniqThink(i), { type: "toolCall", id: "tc" + i, name: "bash", arguments: { command: "c" + i } }] }));
+			b.push(entry({ role: "toolResult", toolCallId: "tc" + i, toolName: "bash", content: [text("output " + i + " ".repeat(1000))], isError: false }));
+		}
+		for (let i = 30; i < 40; i++) b.push(entry({ role: "assistant", content: [uniqThink(i), text("answer " + i)] }));
+		return b;
+	}
+
+	/** Minimal pi projection: latest context_edit per target wins. */
+	function project(branch) {
+		const edits = new Map();
+		for (const e of branch) if (e.type === "context_edit") edits.set(e.targetId, e);
+		return branch
+			.filter((e) => e.type === "message")
+			.map((e) => {
+				const ed = edits.get(e.id);
+				if (!ed) return { sourceEntry: e, messages: [e.message] };
+				if (ed.replacement === null) return { sourceEntry: e, messages: [] };
+				return { sourceEntry: e, messages: [{ ...e.message, content: ed.replacement.content }] };
+			});
+	}
+	const projMessages = (branch) => project(branch).flatMap((p) => p.messages);
+	const chars = (ms) => JSON.stringify(ms).length;
+	const thinkingCount = (ms) => ms.reduce((n, m) => n + (m.role === "assistant" ? m.content.filter((b) => b.type === "thinking").length : 0), 0);
+
+	async function turnEnd() {
+		const r = await handlers.turn_end({ type: "turn_end", entries: [], context: { contextEntries: project(branchEntries) } }, ctxBase);
+		const drafts = r?.entries ?? [];
+		for (const d of drafts) branchEntries.push({ ...d, id: "e" + ++eid });
+		return drafts;
+	}
+	/** One request through the context hook using pi's (edited) projection as input. */
+	async function send() {
+		const input = projMessages(branchEntries);
+		const r = await handlers.context({ type: "context", messages: input }, ctxBase);
+		return r?.messages ?? input;
+	}
+
+	branchEntries = buildBranch();
+	const rawProjection = projMessages(branchEntries);
+	notifications.length = 0;
+	await reseed();
+	await registered.compress.handler("on", ctxBase); // force a compression now
+	const sent1 = await send();
+	check("S17: compression trims 10 outputs / 10 thinking in the request", markersIn(sent1) === 10 && thinkingCount(sent1) === 30, `markers=${markersIn(sent1)} think=${thinkingCount(sent1)}`);
+
+	const d1 = await turnEnd();
+	check("S17: turn_end persists the trim as 20 context_edits", d1.length === 20 && d1.every((d) => d.type === "context_edit"), `drafts=${d1.length}`);
+	const proj1 = projMessages(branchEntries);
+	check("S17: pi's projection now matches the trimmed request", JSON.stringify(proj1) === JSON.stringify(sent1));
+	check("S17: projection shrank", chars(proj1) < chars(rawProjection) * 0.8, `${chars(proj1)} vs ${chars(rawProjection)}`);
+
+	const sent2 = await send();
+	check("S17: next request byte-identical (cache-stable)", JSON.stringify(sent2) === JSON.stringify(sent1));
+	check("S17: turn_end is idempotent (no new edits)", (await turnEnd()).length === 0);
+
+	await registered.compress.handler("off", ctxBase);
+	const sentOff = await send();
+	check("S17: off sends the full original context even though the session is edited", JSON.stringify(sentOff) === JSON.stringify(rawProjection));
+	const dOff = await turnEnd();
+	check("S17: off restores via 20 context_edits", dOff.length === 20, `drafts=${dOff.length}`);
+	check("S17: projection back to original after off", JSON.stringify(projMessages(branchEntries)) === JSON.stringify(rawProjection));
+	check("S17: turn_end idempotent while off", (await turnEnd()).length === 0);
+
+	await registered.compress.handler("on", ctxBase); // back on: frozen spec restored verbatim
+	const sentOn = await send();
+	check("S17: on restores the identical trimmed request", JSON.stringify(sentOn) === JSON.stringify(sent1));
+	const dOn = await turnEnd();
+	check("S17: on re-persists 20 edits and projection matches again", dOn.length === 20 && JSON.stringify(projMessages(branchEntries)) === JSON.stringify(sent1), `drafts=${dOn.length}`);
+
+	// A foreign edit (another extension / pi) must never be overwritten.
+	const foreignTarget = branchEntries.find((e) => e.type === "message" && e.message.toolCallId === "tc0");
+	branchEntries.push({ type: "context_edit", id: "e" + ++eid, targetId: foreignTarget.id, replacement: { content: [text("someone else's summary")] } });
+	const omitTarget = branchEntries.find((e) => e.type === "message" && e.message.role === "assistant" && e.message.content.some((b) => b.id === "tc1"));
+	branchEntries.push({ type: "context_edit", id: "e" + ++eid, targetId: omitTarget.id, replacement: null });
+	await registered.compress.handler("off", ctxBase);
+	await send();
+	const dForeign = await turnEnd();
+	check("S17: foreign replacement / omission left untouched",
+		!dForeign.some((d) => d.targetId === foreignTarget.id || d.targetId === omitTarget.id) && dForeign.length === 18, `drafts=${dForeign.length}`);
+	await registered.compress.handler("on", ctxBase);
+}
+
+// ---------------------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
 if (failed.length) { console.log("FAILED:", failed.map((f) => f.name).join(" | ")); process.exit(1); }
