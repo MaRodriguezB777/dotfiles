@@ -20,12 +20,16 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { discoverAgents } from "./agents.ts";
 import { boardPath, countLines, writeBoard } from "./board.ts";
-import { loadConfig } from "./config.ts";
+import { type SubagentsConfig, loadSettings, settingsTable } from "./config.ts";
 import {
 	type Ev,
 	type FleetTheme,
 	type InspectorState,
+	buildItems,
 	collectFleet,
+	collectTeams,
+	handleInspectorKey,
+	itemKey,
 	readTranscript,
 	renderInspector,
 	renderPlain,
@@ -44,29 +48,76 @@ import {
 	writeRegistry,
 } from "./registry.ts";
 import { launch } from "./spawn.ts";
-import { COLLECT_SPEC, FOLLOWUP_SPEC, PEEK_SPEC, SPAWN_SPEC, STOP_SPEC } from "./text.ts";
+import { widgetLines } from "./widget.ts";
+import { createCompletionNotifier } from "./completion.ts";
+import { HANDOFF_VERSION, claimSink, leave, routeChildEvent, take } from "./handoff.ts";
+import { defineTeam, validateTeam, closeInbox, settleMessages, summary as messageSummary } from "./messaging/index.ts";
+import { reconcileSessionFile } from "./team-runtime.ts";
+import { COLLECT_SPEC, FOLLOWUP_SPEC, PEEK_SPEC, SPAWN_SPEC, STOP_SPEC, TEAM_SPEC } from "./text.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentDef, ChildRecord, Escalation, LiveChild, Registry, Usage } from "./types.ts";
 
-const MAX_CONCURRENT_WRITERS = loadConfig().maxConcurrentWriters;
-const MAX_CONCURRENT_TOTAL = loadConfig().maxConcurrentTotal;
 const PROGRESS_THROTTLE_MS = 1000;
 const STUCK_IDLE_MS = 90_000;
 const STUCK_REPEAT = 3;
 const STUCK_ERRORS = 3;
 const BLOCK_ESCALATE_AT = 3;
 const DEFAULT_COLLECT_TIMEOUT = 600_000;
+/** How long a /reload's run waits for the new instance before its children are stopped. */
+const RELOAD_HANDOFF_MS = 30_000;
 
 export default function (pi: ExtensionAPI) {
 	// A managed child must never get the orchestration tools. Bailing out here
 	// makes recursion structurally impossible rather than merely discouraged.
 	if (process.env.PI_SUBAGENT_CHILD) return;
 
-	const root = process.cwd();
+	// A /reload leaves the previous instance's run (and its still-running
+	// children) behind for us; see handoff.ts.
+	const adopted = take();
+
+	// The project root is the SESSION's cwd (ctx.cwd), which is not necessarily
+	// pi's process cwd: pi launched from $HOME can run a session in a project.
+	// Until a context arrives, the process cwd is the best guess.
+	let root = adopted?.root ?? process.cwd();
 	// Mutable: /subagents-resume-run adopts a previous run in place, so these are
 	// rebound rather than fixed for the life of the session.
-	let runId = Math.random().toString(16).slice(2, 10);
-	let runDir = path.join(root, ".pi", "runs", runId);
+	let runId = adopted?.runId ?? Math.random().toString(16).slice(2, 10);
+	let runDir = adopted?.runDir ?? path.join(root, ".pi", "runs", runId);
+
+	/**
+	 * Follow the session cwd until the run starts. After that the root is fixed:
+	 * live children's claims and cwd are relative to it.
+	 */
+	function bindRoot(cwd: string | undefined): void {
+		if (started || !cwd || cwd === root) return;
+		root = cwd;
+		runDir = path.join(root, ".pi", "runs", runId);
+	}
+
+	/** Pi's trust decision for this project; gates ./.pi/subagents-config.json. */
+	let projectTrusted = true;
+	function bindTrust(ctx: { isProjectTrusted?: () => boolean }): void {
+		try {
+			if (typeof ctx.isProjectTrusted === "function") projectTrusted = ctx.isProjectTrusted();
+		} catch {
+			/* stale ctx: keep the last decision */
+		}
+	}
+
+	/** User file + project file for the current root, merged. */
+	const settings = () => loadSettings(root, projectTrusted);
+	const config = (): SubagentsConfig => settings().config;
+
+	/**
+	 * "writers 2/3": running writers (after this spawn) against the cap, so the
+	 * model sees both that a cap exists and how close it is, before a refusal.
+	 */
+	function writerGauge(isWriter: boolean): string {
+		const others = [...live.values()].filter((l) => !l.settled && l.record.writes.length > 0).length;
+		// The child just started counts once, whether or not it is already in `live`.
+		const n = Math.max(others, isWriter ? 1 : 0);
+		return `writers ${n}/${config().maxConcurrentWriters}`;
+	}
 	const guardPath = path.join(import.meta.dirname, "guard.ts");
 
 	/**
@@ -96,8 +147,8 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	const live = new Map<string, LiveChild>();
-	const procs = new Map<string, ChildProcess>();
+	const live = adopted?.live ?? new Map<string, LiveChild>();
+	const procs = adopted?.procs ?? new Map<string, ChildProcess>();
 	const lastProgressAt = new Map<string, number>();
 	/**
 	 * Escalation kinds that are a GUESS about a still-running child rather than a
@@ -106,18 +157,18 @@ export default function (pi: ExtensionAPI) {
 	const ADVISORY_KINDS = new Set<Escalation["kind"]>(["stuck"]);
 
 	/** child id -> advisories raised, shown in the widget and on collect/peek. */
-	const advisories = new Map<string, Escalation[]>();
+	const advisories = adopted?.advisories ?? new Map<string, Escalation[]>();
 
-	let escalationOffset = 0;
+	let escalationOffset = adopted?.escalationOffset ?? 0;
 	let escalationTimer: NodeJS.Timeout | null = null;
 	let started = false;
+	let adoptionAnnounced = false;
 
 	// A single persistent panel updated in place, never a growing list of chat
 	// entries. This is the whole answer to "don't overpopulate the screen":
 	// live status lives below the editor and disappears when nothing is running;
 	// the scrollback only ever gets one entry per child at start and one at finish.
 	let uiCtx: ExtensionContext | undefined;
-	const WIDGET_ROWS = 6;
 
 	/**
 	 * Children are OS processes that outlive session replacement and teardown, so
@@ -143,36 +194,34 @@ export default function (pi: ExtensionAPI) {
 
 	function renderWidget(): void {
 		if (!uiCtx?.hasUI) return;
-		const rows = [...live.values()].filter((l) => l.record.state === "running");
-		if (rows.length === 0) {
+		const running = [...live.values()].filter((l) => l.record.state === "running");
+		if (running.length === 0) {
 			uiCtx.ui.setWidget("subagents", undefined);
 			return;
 		}
-		rows.sort((a, b) => a.startedAt - b.startedAt);
-		const shown = rows.slice(0, WIDGET_ROWS);
 		// Spend is cumulative over every child this session, including finished
 		// ones. Summing only the running set makes the total visibly drop each
 		// time a child exits, which reads as a bug even though it is only a
 		// display choice.
 		const spent = [...live.values()].reduce((sum, l) => sum + (l.usage.cost ?? 0), 0);
-		const finished = live.size - rows.length;
-		const lines = [
-			`subagents: ${rows.length} active${finished ? ` · ${finished} done` : ""} · $${spent.toFixed(3)} spent`,
-		];
-		for (const l of shown) {
-			const secs = Math.round((Date.now() - l.startedAt) / 1000);
-			const elapsed = secs < 60 ? `${secs}s` : `${Math.round(secs / 60)}m`;
-			const owns = l.record.writes.length ? `owns[${l.record.writes.join(",")}]` : "read-only";
-			const tool = l.tools.at(-1)?.name;
-			// Advisories are shown here and nowhere else until asked for: visible if
-			// you look, silent if you do not.
-			const adv = advisories.get(l.record.id);
-			lines.push(
-				`  ${l.record.id.padEnd(10)} ${l.record.agent.padEnd(8)} ${elapsed.padStart(4)}  ${owns}` +
-					`${tool ? ` · ${tool}` : ""}${adv?.length ? ` · ⚠ ${adv[adv.length - 1].detail}` : ""}`,
-			);
-		}
-		if (rows.length > shown.length) lines.push(`  +${rows.length - shown.length} more — /subagents for detail`);
+		const lines = widgetLines({
+			running: running.map((l) => {
+				// Advisories are shown here and nowhere else until asked for: visible
+				// if you look, silent if you do not.
+				const adv = advisories.get(l.record.id);
+				return {
+					id: l.record.id,
+					agent: l.record.agent,
+					writes: l.record.writes,
+					startedAt: l.startedAt,
+					tool: l.tools.at(-1)?.name,
+					advisory: adv?.length ? adv[adv.length - 1].detail : undefined,
+				};
+			}),
+			done: live.size - running.length,
+			spent,
+			now: Date.now(),
+		});
 		uiCtx.ui.setWidget("subagents", lines, { placement: "belowEditor" });
 	}
 
@@ -180,7 +229,24 @@ export default function (pi: ExtensionAPI) {
 	// live one rather than leaving the widget permanently disabled.
 	pi.on("session_start", (_event, ctx) => {
 		uiCtx = ctx;
+		bindRoot(ctx.cwd);
+		bindTrust(ctx);
 		refreshWidget();
+		// Which files are in effect, so an edit that did nothing is visible.
+		const s = settings();
+		safely(() => ctx.ui.notify(s.summary, s.level));
+		if (adopted && !adoptionAnnounced) {
+			adoptionAnnounced = true;
+			const running = [...live.values()].filter((l) => !l.settled).map((l) => l.record.id);
+			const finished = live.size - running.length;
+			safely(() =>
+				ctx.ui.notify(
+					`subagents: kept run ${runId} across /reload — ${running.length} running` +
+						`${running.length ? ` (${running.join(", ")})` : ""}, ${finished} finished`,
+					"info",
+				),
+			);
+		}
 	});
 
 	/** Collects currently blocked inside execute(), keyed for early resolution. */
@@ -203,6 +269,12 @@ export default function (pi: ExtensionAPI) {
 			writeRegistry(runDir, reg);
 			writeBoard(runDir, reg, 0);
 		});
+		startRunTimers();
+	}
+
+	/** Heartbeat (children watch it) and escalation polling. */
+	function startRunTimers(): void {
+		if (escalationTimer) clearInterval(escalationTimer);
 		escalationTimer = setInterval(() => {
 			beat();
 			pollEscalations();
@@ -236,7 +308,17 @@ export default function (pi: ExtensionAPI) {
 	 * already finished.
 	 */
 	function syncChild(record: ChildRecord): void {
-		const reg = mutateRegistry(runDir, runId, root, (r) => syncChildRecord(r, record));
+		const ended = record.state !== "running";
+		const reg = mutateRegistry(runDir, runId, root, (r) => {
+			syncChildRecord(r, record);
+			// Close before settling, so no send can slip in between the two.
+			if (ended && r.children[record.id]) r.children[record.id].acceptingMessages = false;
+		});
+		if (ended) {
+			// Acknowledge what the session actually persisted, then fail the rest.
+			safely(() => reconcileSessionFile(runDir, record.sessionFile));
+			safely(() => settleMessages(runDir, record.id, record.generation, record.state === "done" ? "recipient finished; only the parent can resume it" : `recipient ${record.state}`));
+		}
 		writeBoard(runDir, reg, countLines(path.join(runDir, "findings.jsonl")));
 	}
 
@@ -257,6 +339,11 @@ export default function (pi: ExtensionAPI) {
 	 * is a pause with the claim released, not a delete.
 	 */
 	async function stopChild(l: LiveChild, reason: string): Promise<void> {
+		stoppedByParent.add(`${l.record.id}:${l.record.generation}`);
+		// Close first so a send racing the stop is refused rather than queued for a
+		// child that will never read it.
+		safely(() => reconcileSessionFile(runDir, l.record.sessionFile));
+		safely(() => closeInbox(runDir, { id: l.record.id, generation: l.record.generation }, "stopped by parent"));
 		const proc = procs.get(l.record.id);
 		if (proc) {
 			const signalGroup = (sig: NodeJS.Signals) => {
@@ -286,8 +373,8 @@ export default function (pi: ExtensionAPI) {
 		}
 		procs.delete(l.record.id);
 		l.settled = true;
-		// You asked for this stop, so a "[subagent x killed]" digest on the next turn
-		// would only report back something you already know.
+		// You asked for this stop, so announcing it would only report back
+		// something you already know.
 		markReported([l.record.id]);
 		// Written after the exit handler has had its say, so a stop is recorded as
 		// a stop rather than as the failure its non-zero exit code looks like.
@@ -327,7 +414,7 @@ export default function (pi: ExtensionAPI) {
 		agent: AgentDef,
 		explicit?: string,
 	): { model: string | null; thinking: string | null } {
-		const cfg = loadConfig();
+		const cfg = config();
 
 		const pick = (setting: string, inherited: string | undefined): string | null => {
 			if (setting === "default") return null; // omit the flag entirely
@@ -354,8 +441,12 @@ export default function (pi: ExtensionAPI) {
 		compact?: boolean;
 		seedUsage?: Usage;
 	}): LiveChild {
+		const teamName = opts.record.team ?? "none";
+		const team = teamName === "none" ? undefined : readRegistry(runDir, runId, root).teams?.[teamName];
 		const { proc, live: l } = launch({
 			record: opts.record,
+			team,
+			config: config(),
 			agent: opts.agent,
 			runDir,
 			childDir: opts.childDir,
@@ -365,23 +456,28 @@ export default function (pi: ExtensionAPI) {
 			resumeFrom: opts.resumeFrom,
 			compact: opts.compact,
 			seedUsage: opts.seedUsage,
-			onEvent: (child, kind) => {
-				if (kind === "settled") {
-					procs.delete(child.record.id);
-					syncChild(child.record);
-					progress(child, true);
-					notifyDone(child);
-				} else {
-					progress(child);
-					detectStuck(child);
-				}
-			},
+			// Routed rather than bound to this instance: after a /reload the next
+			// instance must receive this child's events.
+			onEvent: routeChildEvent,
 		});
 		live.set(opts.record.id, l);
 		procs.set(opts.record.id, proc);
 		syncChild(opts.record); // persist the pid, which reaping depends on
 		progress(l, true);
 		return l;
+	}
+
+	/** Every child event, whichever instance launched the child. */
+	function onChildEvent(child: LiveChild, kind: string): void {
+		if (kind === "settled") {
+			procs.delete(child.record.id);
+			syncChild(child.record);
+			progress(child, true);
+			notifyDone(child);
+		} else {
+			progress(child);
+			detectStuck(child);
+		}
 	}
 
 	/**
@@ -421,57 +517,64 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Children that finished without their result having reached the model yet.
-	 * The digest is NOT sent at completion time, because the parent very often
-	 * calls subagent_collect immediately afterwards and receives the full result
-	 * that way. Queuing at completion would then deliver a redundant summary of
-	 * something already in context, arriving one prompt late.
-	 *
-	 * Instead the decision is deferred to before_agent_start, by which point we
-	 * know whether a collect already reported the child.
+	 * Children an in-flight subagent_collect is waiting on, with how many
+	 * collects are waiting. Their result arrives through that collect, so the
+	 * completion message would only repeat it.
 	 */
-	const pendingDigest = new Set<string>();
+	const awaitedByCollect = new Map<string, number>();
 
-	/** Called by subagent_collect: its result IS the report, so no digest is owed. */
+	/**
+	 * A finished child wakes the parent model. When it is idle this starts a new
+	 * rollout; mid-rollout, pi delivers the message before the next LLM call
+	 * ("steer"). Without this, a parent that ended its turn expecting to be told
+	 * would sit idle until the user typed something.
+	 */
+	let parentRunning = false;
+	const completion = createCompletionNotifier({
+		parentRunning: () => parentRunning,
+		send: (text) =>
+			safely(() =>
+				pi.sendMessage(
+					{ customType: "subagent", content: text, display: true },
+					{ deliverAs: "steer", triggerTurn: true },
+				),
+			),
+		awaited: (id) => (awaitedByCollect.get(id) ?? 0) > 0,
+	});
+
+	/** Called when a child's result reached the model another way (final peek, stop, collect). */
 	function markReported(ids: string[]): void {
-		for (const id of ids) pendingDigest.delete(id);
+		completion.reported(ids);
 	}
 
-	/** Model-facing, non-interrupting. Queued now, delivered only if still unreported. */
+	/**
+	 * `${id}:${generation}` of children the parent stopped. Their exit can land
+	 * after stopChild gave up waiting, and must not read as a completion.
+	 */
+	const stoppedByParent = new Set<string>(adopted?.stoppedByParent ?? []);
+
 	function notifyDone(l: LiveChild): void {
-		pendingDigest.add(l.record.id);
+		if (stoppedByParent.has(`${l.record.id}:${l.record.generation}`)) return;
+		completion.finished({ id: l.record.id, agent: l.record.agent, state: l.record.state });
 	}
 
-	function drainDigests(): string | null {
-		if (pendingDigest.size === 0) return null;
-		const lines: string[] = [];
-		for (const id of pendingDigest) {
-			const l = live.get(id);
-			if (!l) continue;
-			const summary = l.lastText.replace(/\s+/g, " ").slice(0, 220);
-			lines.push(
-				`[subagent ${l.record.id} ${l.record.state}] ${l.record.agent}: ${summary}\n` +
-					`full result: subagent_peek({ id: "${l.record.id}", level: "final" })`,
-			);
-		}
-		pendingDigest.clear();
-		return lines.length ? lines.join("\n") : null;
-	}
-
-	// Deliver outstanding digests into the turn that is about to run, rather than
-	// queuing them a turn ahead of time when we cannot yet know if they are needed.
 	pi.on("before_agent_start", (_event, ctx) => {
 		uiCtx = ctx; // always the freshest ctx we have seen
-		const text = drainDigests();
-		if (!text) return;
-		return {
-			message: {
-				customType: "subagent",
-				content: text,
-				display: true,
-				details: undefined,
-			},
-		};
+		bindRoot(ctx.cwd);
+		bindTrust(ctx);
+	});
+	pi.on("agent_start", () => {
+		parentRunning = true;
+	});
+	// After this LLM call's tools ran (so a collect there has been accounted
+	// for) and before the next call: a steered message lands in time for it.
+	pi.on("turn_end", () => {
+		completion.turnEnded();
+	});
+	// Finished after the last LLM call: pi runs this send once settling is done.
+	pi.on("agent_settled", () => {
+		parentRunning = false;
+		completion.settled();
 	});
 
 	/** Model-facing, interrupting. Only for things the parent must act on now. */
@@ -604,6 +707,37 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 
 	pi.registerTool({
+		...TEAM_SPEC,
+		async execute(_id, params: { name?: string; goal?: string }) {
+			ensureRun();
+			try {
+				if (params.name !== undefined || params.goal !== undefined) {
+					if (!params.name || !params.goal) throw new Error("Provide both name and goal, or neither to list teams.");
+					const team = defineTeam(runDir, params.name, params.goal);
+					refreshBoard();
+					return {
+						content: [{ type: "text" as const, text: `Team ${team.name}: ${team.goal}\nSpawn members with team: "${team.name}", individual tasks, and separate claims.` }],
+						details: team,
+					};
+				}
+				const reg = readRegistry(runDir, runId, root);
+				const text = Object.values(reg.teams ?? {})
+					.map((t) => {
+						const members = Object.values(reg.children).filter((c) => c.team === t.name).map((c) => `${c.id} (${c.state})`);
+						return `${t.name}: ${t.goal}\n  members: ${members.join(", ") || "none yet"}`;
+					})
+					.join("\n");
+				return {
+					content: [{ type: "text" as const, text: text || 'No teams defined. Omitted team defaults to "none" (no direct messaging).' }],
+					details: undefined,
+				};
+			} catch (e) {
+				return { content: [{ type: "text" as const, text: (e as Error).message }], isError: true, details: undefined };
+			}
+		},
+	});
+
+	pi.registerTool({
 		...SPAWN_SPEC,
 		async execute(
 			_id,
@@ -614,6 +748,7 @@ export default function (pi: ExtensionAPI) {
 				reads?: string[];
 				cwd?: string;
 				model?: string;
+				team?: string;
 			},
 			_signal?: AbortSignal,
 			_onUpdate?: unknown,
@@ -635,23 +770,30 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			let team: string;
+			try {
+				team = validateTeam(readRegistry(runDir, runId, root), params.team);
+			} catch (e) {
+				return { content: [{ type: "text", text: (e as Error).message }], isError: true, details: undefined };
+			}
 			const writes = (params.writes ?? []).map((p) => rel(root, p));
+			const { maxConcurrentWriters, maxConcurrentTotal } = config();
 			const running = [...live.values()].filter((l) => l.record.state === "running");
 			const runningWriters = running.filter((l) => l.record.writes.length > 0);
-			if (running.length >= MAX_CONCURRENT_TOTAL) {
+			if (running.length >= maxConcurrentTotal) {
 				return {
-					content: [{ type: "text", text: `Refused: ${MAX_CONCURRENT_TOTAL} subagents already running.` }],
+					content: [{ type: "text", text: `Refused: ${maxConcurrentTotal} subagents already running.` }],
 					isError: true,
 					details: undefined,
 				};
 			}
-			if (writes.length && runningWriters.length >= MAX_CONCURRENT_WRITERS) {
+			if (writes.length && runningWriters.length >= maxConcurrentWriters) {
 				return {
 					content: [
 						{
 							type: "text",
 							text:
-								`Refused: ${MAX_CONCURRENT_WRITERS} writing subagents already running ` +
+								`Refused: writers ${runningWriters.length}/${maxConcurrentWriters} already running ` +
 								`(${runningWriters.map((l) => l.record.id).join(", ")}). Collect one first, or ` +
 								`spawn this child read-only.`,
 						},
@@ -667,6 +809,8 @@ export default function (pi: ExtensionAPI) {
 				id,
 				agent: agent.name,
 				task: params.task,
+				team,
+				acceptingMessages: true,
 				writes,
 				reads: (params.reads ?? []).map((p) => rel(root, p)),
 				cwd: params.cwd ? path.resolve(root, params.cwd) : root,
@@ -687,6 +831,11 @@ export default function (pi: ExtensionAPI) {
 			const verdict = withLock(runDir, () => {
 				const reg = readRegistry(runDir, runId, root);
 				reap(reg);
+				try {
+					validateTeam(reg, team);
+				} catch (e) {
+					return { ok: false, reason: (e as Error).message };
+				}
 				const a = admit(reg, id, writes);
 				if (!a.ok) return a;
 				reg.children[id] = record;
@@ -705,13 +854,14 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "text",
 						text:
-							`${id} started (${agent.name}${record.model ? ` on ${record.model}` : ""}) · ` +
-							`owns[${writes.length ? writes.join(",") : "read-only"}]\n` +
-							`Running in the background. Continue working; you will be told when it finishes.\n` +
+							`${id} started (${agent.name}${record.model ? ` on ${record.model}` : ""}) · team[${team}] · ` +
+							`owns[${writes.length ? writes.join(",") : "read-only"}] · ` +
+							writerGauge(writes.length > 0) +
+							`\nRunning in the background. Continue working; you will be told when it finishes.\n` +
 							`board: ${path.relative(root, boardPath(runDir))}`,
 					},
 				],
-				details: { id, agent: agent.name, writes, model: record.model },
+				details: { id, agent: agent.name, writes, model: record.model, team },
 			};
 		},
 	});
@@ -790,16 +940,24 @@ export default function (pi: ExtensionAPI) {
 			const runningWriters = [...live.values()].filter(
 				(c) => !c.settled && c.record.writes.length > 0 && c.record.id !== params.id,
 			);
-			if (writes.length && runningWriters.length >= MAX_CONCURRENT_WRITERS) {
+			const { maxConcurrentWriters } = config();
+			if (writes.length && runningWriters.length >= maxConcurrentWriters) {
 				return {
 					content: [
-						{ type: "text", text: `Refused: ${MAX_CONCURRENT_WRITERS} writing subagents already running.` },
+						{
+							type: "text",
+							text: `Refused: writers ${runningWriters.length}/${maxConcurrentWriters} already running.`,
+						},
 					],
 					isError: true,
 					details: undefined,
 				};
 			}
 
+			// The previous generation's undelivered mail is settled now, so a resumed
+			// child never receives messages addressed to a run it no longer is.
+			safely(() => reconcileSessionFile(runDir, l.record.sessionFile));
+			safely(() => settleMessages(runDir, l.record.id, l.record.generation, "previous generation ended"));
 			const verdict = withLock(runDir, () => {
 				const reg = readRegistry(runDir, runId, root);
 				reap(reg);
@@ -809,6 +967,9 @@ export default function (pi: ExtensionAPI) {
 				if (c) {
 					c.writes = writes;
 					c.state = "running";
+					c.acceptingMessages = true;
+					c.pid = null;
+					c.startedAt = Date.now();
 					c.endedAt = null;
 					c.exitCode = null;
 					c.generation = l.record.generation + 1;
@@ -824,6 +985,9 @@ export default function (pi: ExtensionAPI) {
 
 			const record: ChildRecord = {
 				...l.record,
+				acceptingMessages: true,
+				pid: null,
+				startedAt: Date.now(),
 				task: params.task,
 				writes,
 				state: "running",
@@ -847,8 +1011,9 @@ export default function (pi: ExtensionAPI) {
 						type: "text",
 						text:
 							`${params.id} resumed (generation ${record.generation}, ${l.usage.turns} prior turns) · ` +
-							`owns[${writes.length ? writes.join(",") : "read-only"}]\n` +
-							`It keeps everything it already learned. You will be told when it finishes.` +
+							`owns[${writes.length ? writes.join(",") : "read-only"}] · ` +
+							writerGauge(writes.length > 0) +
+							`\nIt keeps everything it already learned. You will be told when it finishes.` +
 							(params.compact
 								? `\nCompaction requested; pi applies it only if there is history old enough ` +
 									`to summarize, otherwise the full context is kept.`
@@ -969,12 +1134,19 @@ export default function (pi: ExtensionAPI) {
 						if (done) return;
 						done = true;
 						inflightCollects.delete(handle);
+						for (const l of pending) {
+							const n = (awaitedByCollect.get(l.record.id) ?? 1) - 1;
+							if (n > 0) awaitedByCollect.set(l.record.id, n);
+							else awaitedByCollect.delete(l.record.id);
+						}
 						clearTimeout(timer);
 						signal?.removeEventListener?.("abort", onAbort);
 						resolve(v);
 					};
 					const handle = { resolve: finish };
 					inflightCollects.add(handle);
+					// Until this collect returns, it is the channel for these children.
+					for (const l of pending) awaitedByCollect.set(l.record.id, (awaitedByCollect.get(l.record.id) ?? 0) + 1);
 
 					const timer = setTimeout(() => {
 						timedOut = true;
@@ -1023,6 +1195,16 @@ export default function (pi: ExtensionAPI) {
 				parts.push("");
 			}
 
+			let communication = "";
+			safely(() => {
+				communication = messageSummary(runDir);
+			});
+			// Ordinary exchanges are the children's business; only surface failures,
+			// which may mean some agent is still missing an answer.
+			if (/[1-9]\d* undelivered|retained/.test(communication)) {
+				parts.push("\u2500\u2500 team messages \u2500\u2500", communication, "");
+			}
+
 			const reqs = readRequests();
 			if (reqs.length) {
 				parts.push(`── ${reqs.length} shared-file edit request(s) awaiting you ──`);
@@ -1031,7 +1213,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// This result carries each settled child's full final message, so the
-			// model has been told; cancel the pending digest for those ids.
+			// model has been told; drop any completion message still being batched.
 			markReported(settled.map((l) => l.record.id));
 
 			return {
@@ -1165,7 +1347,7 @@ export default function (pi: ExtensionAPI) {
 					dir,
 					reg,
 					mtime: fs.statSync(claims).mtimeMs,
-					live: heartbeatAge(dir) < loadConfig().orphanStaleMs || childAlive,
+					live: heartbeatAge(dir) < config().orphanStaleMs || childAlive,
 					counts,
 				});
 			} catch {
@@ -1191,19 +1373,31 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("subagents-fleet", {
 		description: "Live view of every subagent on this repo, including other sessions'",
 		handler: async (_args, ctx) => {
-			const snapshot = () => collectFleet(root, started ? runId : null);
+			bindRoot(ctx.cwd);
+			bindTrust(ctx);
+			const current = () => (started ? runId : null);
+			// Folded teams, kept for the life of this view across 1s refreshes.
+			const collapsed = new Set<string>();
+			const snapshot = () => {
+				const fleet = collectFleet(root, current());
+				const teams = collectTeams(root, current(), fleet);
+				return { fleet, teams, items: buildItems(fleet, teams, collapsed) };
+			};
 
 			if (ctx.mode !== "tui") {
-				console.log(renderPlain(snapshot()));
+				console.log(renderPlain(snapshot().items));
 				return;
 			}
 
 			await ctx.ui.custom<void>((tui, theme, _keys, done) => {
 				const st: InspectorState = {
-					fleet: snapshot(),
+					...snapshot(),
+					collapsed,
 					selected: 0,
 					scroll: 0,
-					autoFollow: true,
+					maxScroll: 0,
+					// Row 0 is a team header, which reads from the top.
+					autoFollow: false,
 					expandedTools: false,
 					rows: 32,
 				};
@@ -1212,9 +1406,10 @@ export default function (pi: ExtensionAPI) {
 				let viewport = 1;
 
 				// Only the SELECTED child's transcript is parsed, and only its tail, so
-				// opening this on a long-running agent stays cheap.
+				// opening this on a long-running agent stays cheap. Team rows need none.
 				const loadDetail = (force = false) => {
-					const file = st.fleet[st.selected]?.sessionFile ?? null;
+					const item = st.items[st.selected];
+					const file = item?.kind === "agent" ? item.view.sessionFile : null;
 					if (!file) {
 						evs = [];
 						loadedFrom = null;
@@ -1226,6 +1421,15 @@ export default function (pi: ExtensionAPI) {
 				};
 				loadDetail();
 
+				// Keep the same row selected across refreshes even as the order changes.
+				const refresh = () => {
+					const key = itemKey(st.items[st.selected]);
+					Object.assign(st, snapshot());
+					const at = st.items.findIndex((i) => itemKey(i) === key);
+					st.selected = at >= 0 ? at : Math.min(st.selected, Math.max(0, st.items.length - 1));
+					loadDetail(true);
+				};
+
 				const redraw = () => {
 					tui.requestRender();
 				};
@@ -1234,70 +1438,30 @@ export default function (pi: ExtensionAPI) {
 				// so the view polls. The roster scan is incremental and only the open
 				// transcript is re-read.
 				const timer = setInterval(() => {
-					st.fleet = snapshot();
-					if (st.selected >= st.fleet.length) st.selected = Math.max(0, st.fleet.length - 1);
-					loadDetail(true);
+					refresh();
 					redraw();
 				}, 1000);
-
-				const move = (delta: number) => {
-					const next = st.selected + delta;
-					if (next < 0 || next >= st.fleet.length) return;
-					st.selected = next;
-					st.scroll = 0;
-					st.autoFollow = true;
-					loadDetail();
-				};
-
-				const scrollBy = (delta: number) => {
-					st.autoFollow = false;
-					st.scroll = Math.max(0, st.scroll + delta);
-				};
 
 				const component = {
 					render: (width: number) => {
 						st.rows = tui.terminal?.rows ?? 32;
 						const r = renderInspector(st, evs, width, theme as unknown as FleetTheme);
 						viewport = r.viewport;
+						st.maxScroll = r.maxScroll;
 						return r.lines;
 					},
 					invalidate: () => {},
 					dispose: () => clearInterval(timer),
 					handleInput: (data: string) => {
-						switch (data) {
-							case "\x1b":
-							case "q":
-							case "\x03":
-								clearInterval(timer);
-								done();
-								return;
-							case "\x1b[A":
-							case "k":
-								move(-1);
-								break;
-							case "\x1b[B":
-							case "j":
-								move(1);
-								break;
-							case "\x1b[5~":
-								scrollBy(-viewport);
-								break;
-							case "\x1b[6~":
-								scrollBy(viewport);
-								break;
-							case "x":
-								st.expandedTools = !st.expandedTools;
-								break;
-							case "f":
-								st.autoFollow = !st.autoFollow;
-								break;
-							case "r":
-								st.fleet = snapshot();
-								loadDetail(true);
-								break;
-							default:
-								return;
+						const r = handleInspectorKey(st, data, viewport);
+						if (r.kind === "ignored") return;
+						if (r.kind === "close") {
+							clearInterval(timer);
+							done();
+							return;
 						}
+						if (r.kind === "moved") loadDetail();
+						if (r.kind === "refresh") refresh();
 						redraw();
 					},
 				};
@@ -1309,6 +1473,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("subagents-resume-run", {
 		description: "Adopt a previous subagent run so its children can be followed up",
 		handler: async (_args, ctx) => {
+			bindRoot(ctx.cwd);
+			bindTrust(ctx);
 			const runs = listRuns();
 			if (runs.length === 0) {
 				ctx.ui.notify("No previous subagent runs found under .pi/runs/.", "info");
@@ -1350,10 +1516,16 @@ export default function (pi: ExtensionAPI) {
 					// Anything still marked running is a stale record from a parent that
 					// died without its children standing down (SIGKILL, power loss).
 					if (c.state === "running") c.state = "orphaned";
+					c.acceptingMessages = false;
 					live.set(c.id, adoptLive(c));
 					adopted.push(c);
 				}
 			});
+			// Adopted children are inert, so no queued message can reach them.
+			for (const c of adopted) {
+				safely(() => reconcileSessionFile(runDir, c.sessionFile));
+				safely(() => settleMessages(runDir, c.id, c.generation, "run adopted; child is inert"));
+			}
 			refreshBoard();
 			refreshWidget();
 
@@ -1394,15 +1566,17 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("subagents-info", {
 		description: "Token cost of this extension ('full' for the complete accounting in $EDITOR)",
 		handler: async (args, ctx) => {
+			bindRoot(ctx.cwd);
+			bindTrust(ctx);
 			// Default to the summary: the full report is several hundred lines, and
 			// opening an editor unasked is a worse default than printing 12 lines.
 			if (args?.trim() !== "full") {
-				const summary = buildInfoSummary();
+				const summary = buildInfoSummary(root, settings());
 				if (ctx.mode === "tui") ctx.ui.notify(summary, "info");
 				else console.log(summary);
 				return;
 			}
-			const report = buildInfoReport(root, started ? runDir : null, started ? runId : null);
+			const report = buildInfoReport(root, started ? runDir : null, started ? runId : null, settings());
 			if (ctx.mode !== "tui") {
 				console.log(report);
 				return;
@@ -1432,24 +1606,27 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("subagents", {
-		description: "Show subagent run directory and live status",
+		description: "Show subagent run directory, live status, and active settings with their source",
 		handler: async (_args, ctx) => {
-			if (!started) {
-				ctx.ui.notify("No subagents started in this session.", "info");
-				return;
-			}
-			const lines = [...live.values()].map((l) => statusLine(l));
-			ctx.ui.notify(
-				`run ${runId} · ${path.relative(root, runDir)}\n${lines.join("\n") || "(none)"}`,
-				"info",
-			);
+			bindRoot(ctx.cwd);
+			bindTrust(ctx);
+			const s = settings();
+			const status = started
+				? `run ${runId} · ${path.relative(root, runDir)}\n` +
+					([...live.values()].map((l) => statusLine(l)).join("\n") || "(none)")
+				: "No subagents started in this session.";
+			ctx.ui.notify(`${status}\n\n${settingsTable(s)}`, s.level);
 		},
 	});
 
-	pi.on("session_shutdown", async () => {
-		if (escalationTimer) clearInterval(escalationTimer);
-		if (uiCtx?.hasUI) uiCtx.ui.setWidget("subagents", undefined);
+	/** Stop every running child (process group, SIGTERM then SIGKILL) and record it. */
+	function killAll(why: string): void {
 		for (const [id, proc] of procs) {
+			const child = live.get(id);
+			if (child) {
+				safely(() => reconcileSessionFile(runDir, child.record.sessionFile));
+				safely(() => closeInbox(runDir, { id, generation: child.record.generation }, why));
+			}
 			// Signal the child's whole process group: killing only the child leaves
 			// whatever its bash tool started still running and still writing.
 			const signalGroup = (sig: NodeJS.Signals) => {
@@ -1485,5 +1662,51 @@ export default function (pi: ExtensionAPI) {
 				/* ignore */
 			}
 		}
+	}
+
+	pi.on("session_shutdown", async (event) => {
+		if (escalationTimer) clearInterval(escalationTimer);
+		escalationTimer = null;
+		safely(() => {
+			if (uiCtx?.hasUI) uiCtx.ui.setWidget("subagents", undefined);
+		});
+		// A collect cannot outlive its instance; end it rather than leave it hanging.
+		for (const c of [...inflightCollects]) c.resolve(null);
+		releaseSink();
+
+		// /reload re-imports this code into the same process: hand the run over so
+		// children keep running and stay reachable (collect, peek, followup).
+		// Anything else ends the session, and its children with it.
+		if ((event as { reason?: string } | undefined)?.reason === "reload" && started) {
+			leave(
+				{
+					version: HANDOFF_VERSION,
+					runId,
+					runDir,
+					root,
+					live,
+					procs,
+					advisories,
+					stoppedByParent: [...stoppedByParent],
+					escalationOffset,
+					pendingCompletions: completion.drain(),
+					abandon: () => killAll("parent reloaded without taking over"),
+				},
+				RELOAD_HANDOFF_MS,
+			);
+			return;
+		}
+		killAll("parent shutdown");
 	});
+
+	// Last, so a settle buffered during a /reload is replayed into a fully
+	// initialised instance.
+	const releaseSink = claimSink(onChildEvent);
+	if (adopted) {
+		started = true;
+		beat();
+		startRunTimers();
+		for (const c of adopted.pendingCompletions) completion.finished(c);
+	}
+
 }

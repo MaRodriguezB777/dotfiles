@@ -10,17 +10,21 @@
  * lock-protected registry. The parent is not involved for tiers 1 and 2 —
  * which is what keeps the orchestrator's token cost at zero for the common case.
  *
- * Honest limitation: bash is unbounded. `looksLikeWrite` catches redirects,
+ * Honest limitation: bash is unbounded. bash-targets.ts catches redirects,
  * tee, sed -i, mv/cp/rm and friends, but `python -c`, heredocs into scripts and
  * Makefile targets can all escape it. This is an airbag, not a sandbox.
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { type ExtensionAPI, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { writeBoard, countLines } from "./board.ts";
 import { DEFAULT_SHARED_PATHS as CFG_SHARED, loadConfig } from "./config.ts";
-import { CLAIM_SPEC, NOTES_SPEC, NOTE_SPEC, RELEASE_SPEC, REQUEST_EDIT_SPEC } from "./text.ts";
+import { bashWriteTargets } from "./bash-targets.ts";
+import { CLAIM_SPEC, MESSAGE_TEAM_SPEC, NOTES_SPEC, NOTE_SPEC, RELEASE_SPEC, REQUEST_EDIT_SPEC, TEAM_MESSAGES_SPEC } from "./text.ts";
+import { readMessages, sendMessage } from "./messaging/index.ts";
+import { deliveryBoundary } from "./team-runtime.ts";
 import { matchesAny, readRegistry, rel, reap, writeRegistry, withLock, liveWriters, overlaps } from "./registry.ts";
 
 const CHILD_ID = process.env.PI_SUBAGENT_ID ?? "";
@@ -28,6 +32,8 @@ const RUN_DIR = process.env.PI_SUBAGENT_RUN_DIR ?? "";
 const ROOT = process.env.PI_SUBAGENT_ROOT ?? process.cwd();
 
 const PARENT_PID = Number(process.env.PI_SUBAGENT_PARENT_PID ?? "0");
+const GENERATION = Number(process.env.PI_SUBAGENT_GENERATION ?? "1");
+const TEAM = process.env.PI_SUBAGENT_TEAM || "none";
 /** Grace for a turn boundary to arrive once the parent is known dead. */
 const STAND_DOWN_DEADLINE_MS = 20_000;
 
@@ -204,17 +210,12 @@ export function looksLikeWrite(cmd: string): boolean {
 	);
 }
 
-export function extractWriteTargets(cmd: string): string[] {
-	const out = new Set<string>();
-	for (const m of cmd.matchAll(/>>?\s*([^\s;|&()<>]+)/g)) out.add(m[1]);
-	for (const m of cmd.matchAll(/\btee\s+(?:-a\s+)?([^\s;|&()<>]+)/g)) out.add(m[1]);
-	for (const m of cmd.matchAll(/\bsed\s+[^|;&]*-i[^\s]*\s+(?:'[^']*'|"[^"]*"|\S+)\s+([^\s;|&()<>]+)/g))
-		out.add(m[1]);
-	for (const m of cmd.matchAll(/\b(?:mv|cp|ln|install)\s+(?:-\S+\s+)*\S+\s+([^\s;|&()<>]+)/g)) out.add(m[1]);
-	for (const m of cmd.matchAll(/\b(?:rm|touch|mkdir|rmdir)\s+(?:-\S+\s+)*([^\s;|&()<>]+)/g)) out.add(m[1]);
-	return [...out]
-		.map((t) => t.replace(/^["']|["']$/g, ""))
-		.filter((t) => t && !t.startsWith("-") && !t.startsWith("/dev/"));
+/**
+ * Files a bash command may write, as absolute paths. Relative targets resolve
+ * against `cwd` (the shell's directory), following any `cd` in the command.
+ */
+export function extractWriteTargets(cmd: string, cwd: string = ROOT): string[] {
+	return bashWriteTargets(cmd, cwd);
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +226,12 @@ export interface WriteVerdict {
 	block: true;
 	kind: "outside_root" | "shared_file" | "outside_claim";
 	reason: string;
+}
+
+const TEMP_DIRS = [...new Set(["/tmp", path.resolve(os.tmpdir())])];
+
+function inTempDir(abs: string): boolean {
+	return TEMP_DIRS.some((t) => abs === t || abs.startsWith(`${t}/`));
 }
 
 export function evaluateWrite(
@@ -239,10 +246,14 @@ export function evaluateWrite(
 ): WriteVerdict | undefined {
 	const p = rel(opts.root, rawPath);
 	if (p === ".." || p.startsWith("../")) {
+		// Scratch space: no sibling's project work lives there. Checked only once
+		// the path is known to be outside the project, so a project that itself
+		// sits in /tmp stays under its claims.
+		if (inTempDir(path.resolve(opts.root, rawPath))) return undefined;
 		return {
 			block: true,
 			kind: "outside_root",
-			reason: `"${rawPath}" is outside the project root. Refused.`,
+			reason: `"${rawPath}" is outside the project root. Refused. (Use /tmp for scratch files.)`,
 		};
 	}
 	if (matchesAny(p, opts.shared)) {
@@ -276,9 +287,9 @@ export function evaluateWrite(
 export function evaluateBash(
 	cmd: string,
 	opts: Parameters<typeof evaluateWrite>[1],
+	cwd: string = opts.root,
 ): WriteVerdict | undefined {
-	if (!looksLikeWrite(cmd)) return undefined;
-	for (const target of extractWriteTargets(cmd)) {
+	for (const target of extractWriteTargets(cmd, cwd)) {
 		const v = evaluateWrite(target, opts);
 		if (v) return v;
 	}
@@ -375,6 +386,26 @@ export default function (pi: ExtensionAPI) {
 		latestCtx = ctx;
 	});
 
+	// ---- team message delivery ----------------------------------------------
+	// Mail enters the conversation only at boundaries pi defines as safe: after
+	// a completed turn (never mid-tool) and before final settlement. Delivery at
+	// settlement asks for one more turn; with nothing queued it closes the inbox
+	// atomically so a racing sender is told this agent finished.
+	if (TEAM !== "none") {
+		const me = { id: CHILD_ID, generation: GENERATION };
+		const deliver = (event: any, ctx: any) => {
+			latestCtx = ctx;
+			try {
+				return deliveryBoundary(RUN_DIR, me, event, ctx.sessionManager?.getBranch?.() ?? [], standDown) as any;
+			} catch (e) {
+				appendJSONL(findingsFile(), { t: Date.now(), child: CHILD_ID, kind: "message-error", text: (e as Error).message });
+				return undefined;
+			}
+		};
+		pi.on("turn_end", deliver);
+		pi.on("agent_before_settle", deliver);
+	}
+
 	// ctx.compact() is fire-and-forget, so we await it inside before_agent_start
 	// to guarantee the follow-up turn runs against the compacted context rather
 	// than racing it. The timeout is deliberate: if compaction cannot complete
@@ -419,8 +450,11 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- the boundary -------------------------------------------------------
 
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		const { writes, shared } = myClaim();
+		// Tools resolve relative paths against the session cwd, which is the
+		// child's spawn cwd and need not be the project root.
+		const cwd = (ctx as any)?.cwd ?? ROOT;
 
 		const opts = {
 			root: ROOT,
@@ -446,24 +480,22 @@ export default function (pi: ExtensionAPI) {
 		};
 
 		if (isToolCallEventType("write", event)) {
-			const r = checkPath((event.input as any).path);
+			const r = checkPath(path.resolve(cwd, (event.input as any).path));
 			if (r) return r;
 		}
 		if (isToolCallEventType("edit", event)) {
-			const r = checkPath((event.input as any).path);
+			const r = checkPath(path.resolve(cwd, (event.input as any).path));
 			if (r) return r;
 		}
 		if (isToolCallEventType("bash", event)) {
 			const cmd = (event.input as any).command ?? "";
-			if (looksLikeWrite(cmd)) {
-				for (const target of extractWriteTargets(cmd)) {
-					const r = checkPath(target);
-					if (r) {
-						return {
-							block: true,
-							reason: `${r.reason}\n(Detected in bash command: ${cmd.slice(0, 120)})`,
-						};
-					}
+			for (const target of extractWriteTargets(cmd, cwd)) {
+				const r = checkPath(target);
+				if (r) {
+					return {
+						block: true,
+						reason: `${r.reason}\n(Detected in bash command: ${cmd.slice(0, 120)})`,
+					};
 				}
 			}
 		}
@@ -528,6 +560,40 @@ export default function (pi: ExtensionAPI) {
 			return { content: [{ type: "text", text }], details: undefined };
 		},
 	});
+
+	if (TEAM !== "none") {
+		const me = { id: CHILD_ID, generation: GENERATION };
+		const clean = (e: unknown) => String((e as Error)?.message ?? e).replace(/^subagents: /, "");
+
+		pi.registerTool({
+			...MESSAGE_TEAM_SPEC,
+			async execute(_id, params: { to: string; text: string; reply_to?: string; needs_reply?: boolean }) {
+				try {
+					const r = sendMessage(RUN_DIR, me, params);
+					return {
+						content: [{ type: "text", text: `Queued ${r.message_id} in thread ${r.thread_id} for ${params.to}. Continue your own work; replies arrive automatically.` }],
+						details: r,
+					};
+				} catch (e) {
+					// pi reports a tool failure only when execute throws.
+					throw new Error(clean(e));
+				}
+			},
+		});
+
+		pi.registerTool({
+			...TEAM_MESSAGES_SPEC,
+			async execute(_id, params: { thread_id?: string; view?: "unread" | "recent" | "all"; cursor?: string; limit?: number }) {
+				try {
+					const r = readMessages(RUN_DIR, me, params);
+					return { content: [{ type: "text", text: r.text }], details: r.details };
+				} catch (e) {
+					// pi reports a tool failure only when execute throws.
+					throw new Error(clean(e));
+				}
+			},
+		});
+	}
 
 	if (isReadOnly) return;
 

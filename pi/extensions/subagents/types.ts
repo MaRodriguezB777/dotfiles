@@ -18,6 +18,10 @@ export interface ChildRecord {
 	id: string;
 	agent: string;
 	task: string;
+	/** Parent-assigned; absent on legacy records means "none". */
+	team?: string;
+	/** Closed atomically at final settlement; messages never resurrect a child. */
+	acceptingMessages?: boolean;
 	/** Write claim, as globs relative to the run root. Empty = read-only. */
 	writes: string[];
 	/** Advisory only; shown on the board so siblings can avoid duplicate reading. */
@@ -38,7 +42,13 @@ export interface ChildRecord {
 	generation: number;
 }
 
+export interface TeamRecord {
+	name: string;
+	goal: string;
+}
+
 export interface Registry {
+	teams?: Record<string, TeamRecord>;
 	runId: string;
 	root: string;
 	children: Record<string, ChildRecord>;

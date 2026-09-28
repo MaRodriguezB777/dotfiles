@@ -32,7 +32,14 @@ function globToRegex(glob: string): RegExp {
 	let g = glob.trim().replace(/^\.\//, "").replace(/\/+$/, "");
 	// A bare directory means the whole subtree.
 	if (!/[*?]/.test(g) && !g.includes(".")) g = `${g}/**`;
+	// `dir/**` also covers `dir` itself: owning a subtree includes creating its
+	// root (`mkdir -p dir`). territory()/overlaps() already treat it that way.
+	if (g.endsWith("/**") && g.length > 3) return new RegExp(`^${translate(g.slice(0, -3))}(?:/.*)?$`);
+	return new RegExp(`^${translate(g)}$`);
+}
 
+/** Glob syntax to a regex body (unanchored). */
+function translate(g: string): string {
 	let out = "";
 	for (let i = 0; i < g.length; i++) {
 		const c = g[i];
@@ -57,7 +64,7 @@ function globToRegex(glob: string): RegExp {
 			out += c;
 		}
 	}
-	return new RegExp(`^${out}$`);
+	return out;
 }
 
 const regexCache = new Map<string, RegExp>();

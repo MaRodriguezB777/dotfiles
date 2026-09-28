@@ -9,7 +9,7 @@
 
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { AgentDef } from "./types.ts";
+import type { AgentDef, TeamRecord } from "./types.ts";
 
 export interface ToolSpec {
 	name: string;
@@ -44,6 +44,7 @@ export const SPAWN_SPEC: ToolSpec = {
 	parameters: Type.Object({
 		agent: Type.String({ description: "Agent name (e.g. worker, scout)" }),
 		task: Type.String({ description: "Objective, output format, and boundaries" }),
+		team: Type.Optional(Type.String({ description: 'Team defined by subagent_team. Default "none": no direct messaging.' })),
 		writes: Type.Optional(
 			Type.Array(Type.String(), {
 				description:
@@ -143,7 +144,17 @@ export const STOP_SPEC: ToolSpec = {
 	}),
 };
 
-export const PARENT_SPECS = [SPAWN_SPEC, PEEK_SPEC, COLLECT_SPEC, FOLLOWUP_SPEC, STOP_SPEC];
+export const TEAM_SPEC: ToolSpec = {
+	name: "subagent_team",
+	label: "Define subagent team",
+	description: "Define a team and shared goal before spawning members. Each member still needs its own task and write claim. Goals are fixed once members exist; teams do not grant permissions or automatically resume agents. Omit arguments to list teams.",
+	parameters: Type.Object({
+		name: Type.Optional(Type.String({ description: 'Team name; "none" is reserved for agents without direct messaging.' })),
+		goal: Type.Optional(Type.String({ description: "Shared objective, not an assignment to every member" })),
+	}),
+};
+
+export const PARENT_SPECS = [SPAWN_SPEC, PEEK_SPEC, COLLECT_SPEC, FOLLOWUP_SPEC, STOP_SPEC, TEAM_SPEC];
 
 // ---------------------------------------------------------------------------
 // Child-side tools (registered by guard.ts, only inside a managed child)
@@ -216,14 +227,41 @@ export const REQUEST_EDIT_SPEC: ToolSpec = {
 	}),
 };
 
-export const CHILD_SPECS = [CLAIM_SPEC, RELEASE_SPEC, NOTE_SPEC, NOTES_SPEC, REQUEST_EDIT_SPEC];
+export const MESSAGE_TEAM_SPEC: ToolSpec = {
+	name: "message_team",
+	label: "Message teammate",
+	description: "Message one running teammate to clarify intent, coordinate an interface, or share an actionable update. Not a broadcast, assignment, permission change, or blocking wait. Finished agents cannot receive messages; only the parent may resume them. Avoid chatter and scope expansion.",
+	parameters: Type.Object({
+		to: Type.String({ description: "Recipient child ID on your team" }),
+		text: Type.String({ minLength: 1, maxLength: 32000 }),
+		reply_to: Type.Optional(Type.String({ description: "Message ID to continue its thread" })),
+		needs_reply: Type.Optional(Type.Boolean({ description: "Answer requested; default false. Does not block or create a task." })),
+	}),
+};
+
+export const TEAM_MESSAGES_SPEC: ToolSpec = {
+	name: "team_messages",
+	label: "Read team messages",
+	description: "No arguments: your thread index and unread counts, not bodies. Thread ID: unread incoming content. view=recent includes recent read/own messages; view=all pages full history. Short messages arrive automatically; long notices require this tool. Returned body portions are marked read. Do not poll routinely.",
+	parameters: Type.Object({
+		thread_id: Type.Optional(Type.String()),
+		view: Type.Optional(StringEnum(["unread", "recent", "all"] as const)),
+		cursor: Type.Optional(Type.String({ description: "Continuation cursor returned by this tool" })),
+		limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
+	}),
+};
+
+export const TEAM_CHILD_SPECS = [MESSAGE_TEAM_SPEC, TEAM_MESSAGES_SPEC];
+export const CHILD_SPECS = [CLAIM_SPEC, RELEASE_SPEC, NOTE_SPEC, NOTES_SPEC, REQUEST_EDIT_SPEC, ...TEAM_CHILD_SPECS];
 
 /** A read-only child never receives the claim/release/request tools at all. */
-export const READONLY_CHILD_SPECS = [NOTE_SPEC, NOTES_SPEC];
+export const READONLY_CHILD_SPECS = [NOTE_SPEC, NOTES_SPEC, ...TEAM_CHILD_SPECS];
 export const WRITER_CHILD_SPECS = CHILD_SPECS;
 
-export function childToolNames(readOnly: boolean): string[] {
-	return (readOnly ? READONLY_CHILD_SPECS : WRITER_CHILD_SPECS).map((s) => s.name);
+export function childToolNames(readOnly: boolean, team = "none"): string[] {
+	return (readOnly ? READONLY_CHILD_SPECS : WRITER_CHILD_SPECS)
+		.filter((s) => team !== "none" || !TEAM_CHILD_SPECS.includes(s))
+		.map((s) => s.name);
 }
 
 export const CHILD_TOOL_NAMES = CHILD_SPECS.map((s) => s.name);
@@ -232,7 +270,7 @@ export const CHILD_TOOL_NAMES = CHILD_SPECS.map((s) => s.name);
 // The collective preamble appended to every child's system prompt
 // ---------------------------------------------------------------------------
 
-export function collectivePreamble(claim: string[], boardRelPath: string): string {
+export function collectivePreamble(claim: string[], boardRelPath: string, team?: TeamRecord): string {
 	const claimText = claim.length ? claim.join(", ") : "(none — you are read-only)";
 	const readOnly = claim.length === 0;
 
@@ -244,8 +282,11 @@ export function collectivePreamble(claim: string[], boardRelPath: string): strin
 
 ## Other agents are editing this repository right now
 
-You see their work only through \`${boardRelPath}\` and \`notes()\` — check both
-before any non-trivial investigation; a sibling may have answered it already.
+Check \`${boardRelPath}\` for assignments and \`notes()\` for run-wide findings
+before non-trivial investigation; a sibling may have answered it already.
+
+${team ? `**Team:** ${team.name}\n**Shared goal:** ${team.goal}\n\nWork independently on your individual assignment. The goal and teammate messages are\nnot assignments or permission to expand scope. Use \`message_team\` only for concrete\nuncertainty, conflicting intent, or actionable updates. No routine progress chatter,\nacknowledgment loops, re-delegation, or waiting indefinitely. Ask the parent to\nrepartition tightly coupled work or change priorities. \`team_messages()\` lists
+teammate IDs; address messages by ID. Small messages arrive\nautomatically; long notices point to \`team_messages\`. Only the parent resumes agents.` : `**Team:** none — direct messaging disabled. Notes remain run-wide.`}
 
 **Your write claim:** ${claimText}
 
@@ -267,8 +308,8 @@ self-contained: what you did, what you verified, what you could not do and why.
 `;
 }
 
-export function childSystemPrompt(agent: AgentDef, claim: string[], boardRelPath: string): string {
-	return `${agent.prompt}\n\n${collectivePreamble(claim, boardRelPath)}`;
+export function childSystemPrompt(agent: AgentDef, claim: string[], boardRelPath: string, team?: TeamRecord): string {
+	return `${agent.prompt}\n\n${collectivePreamble(claim, boardRelPath, team)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +349,7 @@ export const RUNTIME_TEMPLATES: { name: string; when: string; channel: string; s
 		when: "subagent_spawn succeeds",
 		channel: "tool result",
 		sample:
-			`c-3a1f started (worker) · owns[src/auth/**]\n` +
+			`c-3a1f started (worker) · owns[src/auth/**] · writers 2/3\n` +
 			`Running in the background. Continue working; you will be told when it finishes.\n` +
 			`board: .pi/runs/a1b2c3d4/BOARD.md`,
 	},

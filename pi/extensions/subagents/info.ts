@@ -7,7 +7,7 @@
 
 import * as path from "node:path";
 import { discoverAgents } from "./agents.ts";
-import { configPath, loadConfig, resolveChildExtensions } from "./config.ts";
+import { type Settings, loadSettings, resolveChildExtensions } from "./config.ts";
 import { collectFleet } from "./fleet.ts";
 import { CAP } from "./peek.ts";
 import {
@@ -15,9 +15,7 @@ import {
 	CHILD_SPECS,
 	GUARD_TEMPLATES,
 	PARENT_SPECS,
-	READONLY_CHILD_SPECS,
 	RUNTIME_TEMPLATES,
-	WRITER_CHILD_SPECS,
 	type ToolSpec,
 	childSystemPrompt,
 	childToolNames,
@@ -142,7 +140,12 @@ function specBlock(spec: ToolSpec, indent = ""): { text: string; chars: number; 
 	return { text: lines.join("\n"), chars: total + snipChars + guideChars, tokens: totalTok };
 }
 
-export function buildInfoReport(root: string, runDir: string | null, runId: string | null): string {
+export function buildInfoReport(
+	root: string,
+	runDir: string | null,
+	runId: string | null,
+	settings: Settings = loadSettings(root, true),
+): string {
 	const agents = discoverAgents(root);
 	const boardRel = runDir
 		? path.relative(root, path.join(runDir, "BOARD.md")).split(path.sep).join("/")
@@ -228,15 +231,16 @@ export function buildInfoReport(root: string, runDir: string | null, runId: stri
 	out.push("impossible rather than merely discouraged.");
 	out.push("");
 
-	const cfg = loadConfig();
+	const cfg = settings.config;
 	const inherited = resolveChildExtensions(undefined, cfg);
 	out.push("### Extensions loaded into children");
 	out.push("");
 	out.push("Children run with --no-extensions so their tool surface is deterministic. The");
 	out.push("following are re-injected with explicit -e flags, because an auth/provider");
 	out.push("adapter is infrastructure, not a feature: a child without one cannot make a");
-	out.push("single model call. Configure via childExtensions in:");
-	out.push(`  ${configPath()}`);
+	out.push("single model call. Configure via childExtensions in ~/.pi/agent/subagents-config.json");
+	out.push("(a project's ./.pi/subagents-config.json may not set it).");
+	for (const line of settings.summary.split("\n")) out.push(`  ${line}`);
 	out.push("");
 	if (inherited.length === 0) {
 		out.push("  (none configured — children will use whatever auth pi resolves natively)");
@@ -320,17 +324,23 @@ export function buildInfoReport(root: string, runDir: string | null, runId: stri
 	let writerToolTotal = 0;
 	let readerToolTotal = 0;
 	const childBlocks: string[] = [];
+	let teamToolTotal = 0;
+	const soloWriter = new Set(childToolNames(false));
+	const soloReader = new Set(childToolNames(true));
 	for (const spec of CHILD_SPECS) {
 		const b = specBlock(spec);
-		writerToolTotal += b.tokens;
-		if (READONLY_CHILD_SPECS.includes(spec)) readerToolTotal += b.tokens;
+		if (soloWriter.has(spec.name)) writerToolTotal += b.tokens;
+		if (soloReader.has(spec.name)) readerToolTotal += b.tokens;
+		if (!soloWriter.has(spec.name)) teamToolTotal += b.tokens;
 		childBlocks.push(b.text);
 	}
 	out.push(`FIXED TOOL COST, WRITER child   : ≈ ${writerToolTotal} tok per request`);
 	out.push(`FIXED TOOL COST, READ-ONLY child: ≈ ${readerToolTotal} tok per request`);
+	out.push(`TEAM MEMBERS ADD                : ≈ ${teamToolTotal} tok per request (team "none" pays nothing)`);
 	out.push("");
 	out.push(`  writer tools   : ${childToolNames(false).join(", ")}`);
 	out.push(`  read-only tools: ${childToolNames(true).join(", ")}`);
+	out.push(`  team tools     : ${CHILD_SPECS.filter((s) => !soloWriter.has(s.name)).map((s) => s.name).join(", ")}`);
 	out.push("");
 	out.push("A child spawned with no write claim is read-only for its whole life and never");
 	out.push("receives claim_paths / release_paths / request_edit at all — so 'read-only' is");
@@ -534,19 +544,27 @@ function indentBlock(text: string, prefix: string): string {
  * derived from the same specs the full report walks, so the two can never
  * disagree.
  */
-export function buildInfoSummary(): string {
-	const cfg = loadConfig();
-	const agents = discoverAgents(process.cwd());
+export function buildInfoSummary(root: string = process.cwd(), settings: Settings = loadSettings(root, true)): string {
+	const cfg = settings.config;
+	const agents = discoverAgents(root);
 	const worker = agents.get("worker") ?? [...agents.values()][0];
 
 	const specTok = (s: ToolSpec) =>
 		tok(s.name.length + s.description.length) + tok(schemaWire(s).length, "schema");
 
 	const parentTools = PARENT_SPECS.reduce((n, s) => n + specTok(s), 0);
-	const writerTools = WRITER_CHILD_SPECS.reduce((n, s) => n + specTok(s), 0);
-	const readOnlyTools = READONLY_CHILD_SPECS.reduce((n, s) => n + specTok(s), 0);
+	// Children only receive team tools when assigned to a team, so price both.
+	const toolsFor = (readOnly: boolean, team?: string) => {
+		const names = new Set(childToolNames(readOnly, team));
+		return CHILD_SPECS.filter((s) => names.has(s.name)).reduce((n, s) => n + specTok(s), 0);
+	};
+	const sampleTeam = { name: "team", goal: "Shared objective." };
+	const writerTools = toolsFor(false);
+	const readOnlyTools = toolsFor(true);
+	const teamTools = toolsFor(false, sampleTeam.name);
 	const writerPrompt = worker ? tok(childSystemPrompt(worker, ["src/**"], "BOARD.md").length) : 0;
 	const readOnlyPrompt = worker ? tok(childSystemPrompt(worker, [], "BOARD.md").length) : 0;
+	const teamPrompt = worker ? tok(childSystemPrompt(worker, ["src/**"], "BOARD.md", sampleTeam).length) : 0;
 
 	const row = (label: string, prompt: number, tools: number) =>
 		`  ${label.padEnd(22)}${String(prompt).padStart(8)}${String(tools).padStart(8)}${String(prompt + tools).padStart(8)}`;
@@ -559,7 +577,7 @@ export function buildInfoSummary(): string {
 	// never go stale.
 	let biggest = "";
 	try {
-		const fleet = collectFleet(process.cwd(), null);
+		const fleet = collectFleet(root, null);
 		const top = fleet.reduce((a, b) => (b.tokens > (a?.tokens ?? 0) ? b : a), fleet[0]);
 		if (top?.tokens) {
 			const t = top.tokens >= 1e6 ? `${(top.tokens / 1e6).toFixed(1)}M` : `${Math.round(top.tokens / 1000)}k`;
@@ -576,6 +594,7 @@ export function buildInfoSummary(): string {
 		row("main agent", 0, parentTools),
 		row("child (writer)", writerPrompt, writerTools),
 		row("child (read-only)", readOnlyPrompt, readOnlyTools),
+		row("child (writer, team)", teamPrompt, teamTools),
 		"",
     "",
 		`*Progressive context disclosure and background agents for productivity at token efficiency*`,

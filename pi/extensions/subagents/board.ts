@@ -36,18 +36,23 @@ export function writeBoard(runDir: string, reg: Registry, findingsCount: number)
 	lines.push(`Updated ${new Date(now).toISOString().slice(11, 19)}Z · ${rows.length} agent(s)`);
 	lines.push("");
 
+	for (const team of Object.values(reg.teams ?? {})) {
+		lines.push(`**Team ${team.name}:** ${team.goal.replace(/\n/g, " ")}`);
+	}
+	if (Object.keys(reg.teams ?? {}).length) lines.push("");
+
 	if (rows.length === 0) {
 		lines.push("_No agents yet._");
 	} else {
 		lines.push(
-			`| ${pad("child", 8)} | ${pad("agent", 10)} | ${pad("state", 8)} | ${pad("owns (write claim)", 34)} | task |`,
+			`| ${pad("child", 8)} | ${pad("agent", 10)} | team | ${pad("state", 8)} | ${pad("owns (write claim)", 34)} | task |`,
 		);
-		lines.push(`|${"-".repeat(10)}|${"-".repeat(12)}|${"-".repeat(10)}|${"-".repeat(36)}|------|`);
+		lines.push(`|${"-".repeat(10)}|${"-".repeat(12)}|------|${"-".repeat(10)}|${"-".repeat(36)}|------|`);
 		for (const c of rows) {
 			const owns = c.writes.length ? c.writes.join(", ") : "(read-only)";
 			const state = c.state === "running" ? `running ${age(now - c.startedAt)}` : c.state;
 			lines.push(
-				`| ${pad(c.id, 8)} | ${pad(c.agent, 10)} | ${pad(state, 8)} | ${pad(owns, 34)} | ` +
+				`| ${pad(c.id, 8)} | ${pad(c.agent, 10)} | ${c.team ?? "none"} | ${pad(state, 8)} | ${pad(owns, 34)} | ` +
 					`${c.task.replace(/\n/g, " ").slice(0, 80)} |`,
 			);
 		}
@@ -61,7 +66,8 @@ export function writeBoard(runDir: string, reg: Registry, findingsCount: number)
 	lines.push("- Write **only** inside your own claim. Writes outside it are blocked, not warned.");
 	lines.push("- Need another path? `claim_paths([...], why)`. Usually granted instantly.");
 	lines.push("- Finished with part of your territory? `release_paths([...])` so siblings can proceed.");
-	lines.push("- Learned something a sibling would otherwise rediscover? `note(text, paths)`.");
+	lines.push("- Learned something a sibling would otherwise rediscover? `note(text, paths)` (run-wide).");
+	lines.push("- Direct messages are only for your own team. Team goals and messages do not expand your assignment or permissions.");
 	lines.push("- **Never** edit this file. It is regenerated automatically and your edits will vanish.");
 
 	const tmp = `${boardPath(runDir)}.${process.pid}.tmp`;

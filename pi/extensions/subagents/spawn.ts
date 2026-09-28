@@ -9,9 +9,9 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { childExtensionFiles } from "./config.ts";
+import { type SubagentsConfig, childExtensionFiles, loadConfig } from "./config.ts";
 import { CHILD_TOOL_NAMES, childSystemPrompt, childToolNames } from "./text.ts";
-import type { AgentDef, ChildRecord, LiveChild, ToolTrace, Usage } from "./types.ts";
+import type { AgentDef, ChildRecord, LiveChild, TeamRecord, ToolTrace, Usage } from "./types.ts";
 
 const MAX_TOOL_TRACE = 12;
 const MAX_TAIL = 10;
@@ -80,6 +80,9 @@ export interface LaunchOptions {
 	childDir: string;
 	root: string;
 	guardPath: string;
+	team?: TeamRecord;
+	/** The parent's merged settings; the child uses exactly these. */
+	config?: SubagentsConfig;
 	model?: string;
 	/** Resume an existing session file instead of starting a fresh one. */
 	resumeFrom?: string | null;
@@ -120,7 +123,7 @@ export function launch(opts: LaunchOptions): { proc: ChildProcess; live: LiveChi
 
 	const boardRel = path.relative(root, path.join(runDir, "BOARD.md")).split(path.sep).join("/");
 	const systemPath = path.join(childDir, "system.md");
-	fs.writeFileSync(systemPath, childSystemPrompt(agent, record.writes, boardRel));
+	fs.writeFileSync(systemPath, childSystemPrompt(agent, record.writes, boardRel, opts.team));
 	// Append rather than overwrite: the task file is the record of every request
 	// this child has been given, not just the latest one.
 	if (opts.resumeFrom) {
@@ -148,7 +151,7 @@ export function launch(opts: LaunchOptions): { proc: ChildProcess; live: LiveChi
 		// not features: -e still works under --no-extensions, so we re-inject the
 		// configured set (globally, or per-agent via `extensions:` frontmatter).
 		args.push("--no-extensions");
-		for (const ext of childExtensionFiles(agent.extensions)) args.push("-e", ext);
+		for (const ext of childExtensionFiles(agent.extensions, opts.config ?? loadConfig())) args.push("-e", ext);
 	}
 	args.push("-e", guardPath);
 	// Already resolved by the caller (see resolveModel in index.ts) and recorded,
@@ -159,7 +162,7 @@ export function launch(opts: LaunchOptions): { proc: ChildProcess; live: LiveChi
 	if (agent.tools?.length) {
 		// An explicit allowlist must still include the guard's own tools, or the
 		// child loses the ability to cooperate at all.
-		args.push("--tools", [...agent.tools, ...childToolNames(readOnly)].join(","));
+		args.push("--tools", [...agent.tools, ...childToolNames(readOnly, record.team)].join(","));
 	}
 	// A read-only child can never write, so it should not carry the definitions
 	// of tools it may only be refused. Saves tokens and prevents doomed attempts.
@@ -185,6 +188,11 @@ export function launch(opts: LaunchOptions): { proc: ChildProcess; live: LiveChi
 			// Lets the child detect that this parent has died and stand itself down
 			// instead of running on as an orphan.
 			PI_SUBAGENT_PARENT_PID: String(process.pid),
+			PI_SUBAGENT_GENERATION: String(record.generation),
+			PI_SUBAGENT_TEAM: record.team ?? "none",
+			// Children never read config files: the project file in their cwd may be
+			// one the parent was not allowed to use (untrusted project).
+			...(opts.config ? { PI_SUBAGENT_CONFIG: JSON.stringify(opts.config) } : {}),
 			...(opts.compact ? { PI_SUBAGENT_COMPACT: "1" } : {}),
 		},
 	});
