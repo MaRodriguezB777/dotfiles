@@ -157,3 +157,49 @@ test("sendMessage caps the whole run at 1000 messages", () => {
 	fs.writeFileSync(path.join(runDir, "messages", `${first.thread_id}.json`), JSON.stringify(th));
 	assert.throws(() => sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: "over" }), /1,?000|limit/i);
 });
+
+test("sendMessage resolves a unique teammate name to its full id", () => {
+	const runDir = tmpRun();
+	const reg = readReg(runDir);
+	reg.teams = { api: { name: "api", goal: "g" }, ui: { name: "ui", goal: "g" } };
+	writeReg(runDir, reg);
+	addChild(runDir, "lead-0001", { team: "api", name: "lead" });
+	addChild(runDir, "cleanup-aaaa", { team: "api", name: "cleanup" });
+	addChild(runDir, "cleanup-bbbb", { team: "ui", name: "cleanup" });
+	const res = sendMessage(runDir, actor("lead-0001"), { to: "cleanup", text: "hi" });
+	assert.equal(res.to, "cleanup-aaaa");
+	const th = readThreadFile(runDir, res.thread_id);
+	assert.deepEqual(th.messages[0].to, { id: "cleanup-aaaa", generation: 1 }, "stored under the full id");
+	assert.deepEqual(th.participants.map((p: any) => p.id), ["lead-0001", "cleanup-aaaa"]);
+	// Replying by name continues the same thread.
+	const again = sendMessage(runDir, actor("lead-0001"), { to: "cleanup", text: "more", reply_to: res.message_id });
+	assert.equal(again.thread_id, res.thread_id);
+	// And the recipient can answer by name too.
+	assert.equal(sendMessage(runDir, actor("cleanup-aaaa"), { to: "lead", text: "ok" }).to, "lead-0001");
+});
+
+test("sendMessage refuses a name shared by two teammates, naming both full ids", () => {
+	const runDir = tmpRun();
+	const reg = readReg(runDir);
+	reg.teams = { api: { name: "api", goal: "g" } };
+	writeReg(runDir, reg);
+	addChild(runDir, "lead-0001", { team: "api", name: "lead" });
+	addChild(runDir, "cleanup-aaaa", { team: "api", name: "cleanup" });
+	addChild(runDir, "cleanup-bbbb", { team: "api", name: "cleanup", state: "done" });
+	assert.throws(
+		() => sendMessage(runDir, actor("lead-0001"), { to: "cleanup", text: "hi" }),
+		/"cleanup" is ambiguous on team api: cleanup-aaaa, cleanup-bbbb\. Use the full ID\./,
+	);
+	assert.equal(sendMessage(runDir, actor("lead-0001"), { to: "cleanup-aaaa", text: "hi" }).to, "cleanup-aaaa");
+	assert.equal(threadFiles(runDir).length, 1);
+});
+
+test("a name on another team does not resolve", () => {
+	const runDir = tmpRun();
+	const reg = readReg(runDir);
+	reg.teams = { api: { name: "api", goal: "g" }, ui: { name: "ui", goal: "g" } };
+	writeReg(runDir, reg);
+	addChild(runDir, "lead-0001", { team: "api", name: "lead" });
+	addChild(runDir, "cleanup-bbbb", { team: "ui", name: "cleanup" });
+	assert.throws(() => sendMessage(runDir, actor("lead-0001"), { to: "cleanup", text: "hi" }), /no such agent "cleanup"/);
+});

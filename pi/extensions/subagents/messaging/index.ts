@@ -16,6 +16,7 @@
 import * as crypto from "node:crypto";
 import type { ChildRecord, Registry } from "../types.ts";
 import { pidAlive, withLock } from "../registry.ts";
+import { resolveRecipient } from "../naming.ts";
 import {
 	isMessageId,
 	isThreadId,
@@ -204,13 +205,13 @@ export function sendMessage(
 	runDir: string,
 	actor: Actor,
 	input: SendInput,
-): { message_id: string; thread_id: string } {
+): { message_id: string; thread_id: string; to: string } {
 	const text = typeof input?.text === "string" ? input.text : "";
 	if (!text.trim()) fail("message text is empty");
 	if (text.length > MAX_TEXT_CHARS) {
 		fail(`message text is too long (${text.length.toLocaleString("en-US")} chars, limit 32,000)`);
 	}
-	const to = typeof input?.to === "string" ? input.to.trim() : "";
+	let to = typeof input?.to === "string" ? input.to.trim() : "";
 	if (!to) fail("no recipient given");
 	const replyTo = input?.reply_to == null ? null : String(input.reply_to).trim();
 	if (replyTo !== null && !isThreadId(replyTo) && !isMessageId(replyTo)) {
@@ -228,6 +229,12 @@ export function sendMessage(
 			);
 		}
 		if (!isRunning(sender)) fail(`sender ${actor.id} is not running`);
+		// A unique teammate name stands for its full ID; everything below uses the ID.
+		try {
+			to = resolveRecipient(reg.children, actor.id, to);
+		} catch (e) {
+			fail((e as Error).message);
+		}
 		if (to === actor.id) fail("you cannot message yourself");
 
 		const recipient = child(reg, to);
@@ -305,7 +312,7 @@ export function sendMessage(
 		};
 		thread.messages.push(message);
 		saveThread(runDir, thread);
-		return { message_id: message.id, thread_id: thread.id };
+		return { message_id: message.id, thread_id: thread.id, to };
 	});
 }
 

@@ -571,7 +571,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					const r = sendMessage(RUN_DIR, me, params);
 					return {
-						content: [{ type: "text", text: `Queued ${r.message_id} in thread ${r.thread_id} for ${params.to}. Continue your own work; replies arrive automatically.` }],
+						content: [{ type: "text", text: `Queued ${r.message_id} in thread ${r.thread_id} for ${r.to}. Continue your own work; replies arrive automatically.` }],
 						details: r,
 					};
 				} catch (e) {

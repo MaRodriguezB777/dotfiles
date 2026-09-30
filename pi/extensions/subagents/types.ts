@@ -18,6 +18,11 @@ export interface ChildRecord {
 	id: string;
 	agent: string;
 	task: string;
+	/**
+	 * Optional name given at spawn; the ID is then `<name>-<hex>`. Teammates may
+	 * message a unique name without the suffix (see naming.ts). Absent = unnamed.
+	 */
+	name?: string;
 	/** Parent-assigned; absent on legacy records means "none". */
 	team?: string;
 	/** Closed atomically at final settlement; messages never resurrect a child. */

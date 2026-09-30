@@ -36,7 +36,8 @@ defineTeam(runDir, name, goal): Team          // idempotent; goal immutable once
 validateTeam(reg, team?): string              // undefined/"none" -> "none"; throws on reserved/unknown
 listTeams(runDir): Team[]
 
-sendMessage(runDir, actor, { to, text, reply_to?, needs_reply? }): { message_id, thread_id }
+sendMessage(runDir, actor, { to, text, reply_to?, needs_reply? }): { message_id, thread_id, to }
+                                              // `to` may be a teammate's bare name; the result carries the resolved full ID
 readMessages(runDir, actor, { thread_id?, view?, cursor?, limit? }): { text, details }
 prepareDelivery(runDir, actor, closing?): { text, receipt } | null
 acknowledgeDelivery(runDir, receipt): void

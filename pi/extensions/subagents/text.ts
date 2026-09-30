@@ -43,6 +43,13 @@ export const SPAWN_SPEC: ToolSpec = {
 	],
 	parameters: Type.Object({
 		agent: Type.String({ description: "Agent name (e.g. worker, scout)" }),
+		name: Type.Optional(
+			Type.String({
+				description:
+					'Optional short name for this child, e.g. "cleanup". Its ID becomes <name>-<4 hex> ' +
+					"(cleanup-3a1f); without one it is c-<4 hex>. Always refer to it by the full ID.",
+			}),
+		),
 		task: Type.String({ description: "Objective, output format, and boundaries" }),
 		team: Type.Optional(Type.String({ description: 'Team defined by subagent_team. Default "none": no direct messaging.' })),
 		writes: Type.Optional(
@@ -232,7 +239,9 @@ export const MESSAGE_TEAM_SPEC: ToolSpec = {
 	label: "Message teammate",
 	description: "Message one running teammate to clarify intent, coordinate an interface, or share an actionable update. Not a broadcast, assignment, permission change, or blocking wait. Finished agents cannot receive messages; only the parent may resume them. Avoid chatter and scope expansion.",
 	parameters: Type.Object({
-		to: Type.String({ description: "Recipient child ID on your team" }),
+		to: Type.String({
+			description: "Teammate's full ID (cleanup-3a1f), or just its name (cleanup) if no other teammate shares it",
+		}),
 		text: Type.String({ minLength: 1, maxLength: 32000 }),
 		reply_to: Type.Optional(Type.String({ description: "Message ID to continue its thread" })),
 		needs_reply: Type.Optional(Type.Boolean({ description: "Answer requested; default false. Does not block or create a task." })),
@@ -286,7 +295,7 @@ Check \`${boardRelPath}\` for assignments and \`notes()\` for run-wide findings
 before non-trivial investigation; a sibling may have answered it already.
 
 ${team ? `**Team:** ${team.name}\n**Shared goal:** ${team.goal}\n\nWork independently on your individual assignment. The goal and teammate messages are\nnot assignments or permission to expand scope. Use \`message_team\` only for concrete\nuncertainty, conflicting intent, or actionable updates. No routine progress chatter,\nacknowledgment loops, re-delegation, or waiting indefinitely. Ask the parent to\nrepartition tightly coupled work or change priorities. \`team_messages()\` lists
-teammate IDs; address messages by ID. Small messages arrive\nautomatically; long notices point to \`team_messages\`. Only the parent resumes agents.` : `**Team:** none — direct messaging disabled. Notes remain run-wide.`}
+teammate IDs; address messages by ID, or by name alone when no other teammate\nshares it. Small messages arrive\nautomatically; long notices point to \`team_messages\`. Only the parent resumes agents.` : `**Team:** none — direct messaging disabled. Notes remain run-wide.`}
 
 **Your write claim:** ${claimText}
 

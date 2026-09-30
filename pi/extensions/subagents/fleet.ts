@@ -6,8 +6,11 @@
  * roster on the left, a transcript detail pane on the right, and a key-hint
  * footer with a position counter.
  *
+ * Hovering an agent or team and pressing `t` (Enter on an agent) lists its
+ * message threads; opening one shows the messages live.
+ *
  * This module adds NO behaviour. It never spawns, kills, claims or writes; it
- * only reads `.pi/runs/` and session transcripts. Nothing here reaches the
+ * only reads `.pi/runs/`, thread files and session transcripts. Nothing here reaches the
  * model, so the whole view costs zero tokens.
  */
 
@@ -76,6 +79,8 @@ interface MessageCounts {
 
 export interface ThreadView {
 	id: string;
+	/** Thread JSON on disk, re-read only when the thread is opened. */
+	file: string;
 	team: string;
 	/** The two participants, in the order the thread records them. */
 	between: [string, string];
@@ -114,10 +119,12 @@ function readThreads(runDir: string): ThreadView[] {
 	const out: ThreadView[] = [];
 	for (const f of files) {
 		try {
-			const th = JSON.parse(fs.readFileSync(path.join(runDir, "messages", f), "utf8"));
+			const file = path.join(runDir, "messages", f);
+			const th = JSON.parse(fs.readFileSync(file, "utf8"));
 			const ids = (th.participants ?? []).map((p: any) => String(p.id));
 			const t: ThreadView = {
 				id: String(th.id),
+				file,
 				team: String(th.team ?? "none"),
 				between: [ids[0] ?? "?", ids[1] ?? "?"],
 				messages: 0,
@@ -506,6 +513,70 @@ function briefArgs(name: string, args: any): string {
 	return typeof v === "string" ? v : "";
 }
 
+/* ------------------------------------------------------------------ threads */
+
+/** One message of an opened thread, flattened for display. */
+export interface ThreadMessage {
+	id: string;
+	seq: number;
+	from: string;
+	to: string;
+	at: number;
+	text: string;
+	needsReply: boolean;
+	replyTo: string | null;
+	inbound: "queued" | "delivered" | "undelivered";
+	inboundReason: string | null;
+	/** Characters of `text` the recipient has read (unions of read ranges). */
+	readChars: number;
+	readFull: boolean;
+	failure: string | null;
+}
+
+/**
+ * Read every message of one thread, oldest first. Lock-free like readThreads:
+ * the file is replaced by rename, so a read sees either the old or new
+ * version, and a torn read just shows nothing until the next poll.
+ */
+export function readThreadMessages(file: string): ThreadMessage[] {
+	let th: any;
+	try {
+		th = JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch {
+		return [];
+	}
+	const out: ThreadMessage[] = [];
+	for (const m of th?.messages ?? []) {
+		const text = String(m?.text ?? "");
+		let readChars = 0;
+		for (const r of m?.read?.ranges ?? []) {
+			if (Array.isArray(r)) readChars += Math.max(0, Number(r[1]) - Number(r[0]) || 0);
+		}
+		out.push({
+			id: String(m?.id ?? "?"),
+			seq: Number(m?.seq) || 0,
+			from: String(m?.from?.id ?? "?"),
+			to: String(m?.to?.id ?? "?"),
+			at: Number(m?.at) || 0,
+			text,
+			needsReply: Boolean(m?.needs_reply),
+			replyTo: m?.reply_to ? String(m.reply_to) : null,
+			inbound: m?.inbound?.state === "undelivered" || m?.inbound?.state === "queued" ? m.inbound.state : "delivered",
+			inboundReason: m?.inbound?.reason ? String(m.inbound.reason) : null,
+			readFull: Boolean(m?.read?.full),
+			readChars: m?.read?.full ? text.length : Math.min(text.length, readChars),
+			failure: m?.failure?.reason ? String(m.failure.reason) : null,
+		});
+	}
+	return out.sort((a, b) => a.seq - b.seq || a.at - b.at);
+}
+
+/** Threads reachable from a roster row: a team's threads, or those an agent takes part in. */
+export function threadsOf(item: Item | undefined): ThreadView[] {
+	if (!item) return [];
+	return item.kind === "team" ? item.team.threads : item.view.threads;
+}
+
 /* ---------------------------------------------------------------- helpers */
 
 function fit(text: string, width: number): string {
@@ -572,6 +643,25 @@ export interface InspectorState {
 	autoFollow: boolean;
 	expandedTools: boolean;
 	rows: number;
+	/**
+	 * Thread browsing for the selected row. null = normal roster/detail view.
+	 * "pick" lists the row's threads with `threadId` highlighted; "open" shows
+	 * that thread's messages. The roster selection is frozen while browsing.
+	 */
+	threadNav?: ThreadNav | null;
+}
+
+export interface ThreadNav {
+	mode: "pick" | "open";
+	/** Highlighted (pick) or opened (open) thread; kept by id so refreshes don't move it. */
+	threadId: string;
+}
+
+/** The thread list for the selected row and the index of the nav's thread in it (-1 if gone). */
+export function navPosition(st: InspectorState): { threads: ThreadView[]; index: number } {
+	const threads = threadsOf(st.items[st.selected]);
+	const id = st.threadNav?.threadId;
+	return { threads, index: id ? threads.findIndex((t) => t.id === id) : -1 };
 }
 
 const n = (x: number) => x.toLocaleString("en-US");
@@ -774,6 +864,89 @@ function teamDetail(t: TeamView, width: number, theme: FleetTheme, folded = fals
 	return { header: header.map((l) => truncateToWidth(l, w)), body: body.map((l) => truncateToWidth(l, w)) };
 }
 
+/** Label for whose threads are being browsed. */
+function ownerLabel(item: Item): string {
+	return item.kind === "team" ? `team ${teamLabel(item.team)}` : `${item.view.record.agent} · ${item.view.record.id}`;
+}
+
+/** Thread picker: one row per thread, the highlighted one marked. */
+function threadPicker(item: Item, threads: ThreadView[], cursor: number, width: number, theme: FleetTheme): { header: string[]; body: string[] } {
+	const w = Math.max(8, width);
+	const header = [
+		rightAligned(` ${theme.fg("accent", "✉")} ${theme.bold(`Threads of ${ownerLabel(item)}`)}`, theme.fg("dim", teamTotals(threads)), w),
+		"",
+	];
+	const self = item.kind === "agent" ? item.view.record.id : null;
+	const body = threads.map((t, i) => {
+		const sel = i === cursor;
+		const marker = sel ? theme.fg("accent", "›") : " ";
+		// From an agent, name the other side; from a team, both sides.
+		const who = self ? `↔ ${t.between[0] === self ? t.between[1] : t.between[0]}` : `${t.between[0]} ↔ ${t.between[1]}`;
+		const mine = self ? ` (${t.sentBy[self] ?? 0}↑ ${t.messages - (t.sentBy[self] ?? 0)}↓)` : "";
+		const meta = `· ${t.id} · ${plural(t.messages, "msg")}${mine} · ${n(t.chars)} chars${flags(t)} · ${ago(t.lastAt)}`;
+		return `${marker} ${sel ? theme.bold(who) : who} ${theme.fg("dim", meta)}`;
+	});
+	return { header: header.map((l) => truncateToWidth(l, w)), body: body.map((l) => truncateToWidth(l, w)) };
+}
+
+/** Status words for one message; empty for a delivered, fully read message with nothing special. */
+function messageFlags(m: ThreadMessage, theme: FleetTheme): string[] {
+	const out: string[] = [];
+	if (m.replyTo) out.push(theme.fg("dim", `↩ ${m.replyTo}`));
+	if (m.needsReply) out.push(theme.fg("warning", "needs reply"));
+	if (m.inbound === "undelivered") {
+		out.push(theme.fg("error", `undelivered${m.inboundReason ? `: ${m.inboundReason}` : ""}`));
+	} else {
+		if (m.inbound === "queued") out.push(theme.fg("warning", "queued"));
+		if (!m.readFull) {
+			out.push(theme.fg("warning", m.readChars ? `read ${n(m.readChars)}/${n(m.text.length)} chars` : "unread"));
+		}
+	}
+	if (m.failure) out.push(theme.fg("error", `failed: ${m.failure}`));
+	return out;
+}
+
+/** An opened thread: pinned title, then every message in send order. */
+function threadMessagesDetail(
+	item: Item,
+	thread: ThreadView,
+	msgs: ThreadMessage[],
+	position: string,
+	width: number,
+	theme: FleetTheme,
+): { header: string[]; body: string[] } {
+	const w = Math.max(8, width);
+	// Each participant keeps one colour, so the conversation reads at a glance.
+	const color = (id: string) => (id === thread.between[0] ? "accent" : "success");
+	const header = [
+		rightAligned(
+			` ${theme.fg("accent", "✉")} ${theme.bold(`${thread.between[0]} ↔ ${thread.between[1]}`)} ${theme.fg("dim", `· ${thread.id}`)}`,
+			theme.fg("dim", `${plural(thread.messages, "msg")} · ${n(thread.chars)} chars`),
+			w,
+		),
+		`  ${theme.fg("dim", `team ${thread.team} · from ${ownerLabel(item)} · thread ${position}${flags(thread)}`)}`,
+		"",
+	];
+	const body: string[] = [];
+	for (const m of msgs) {
+		const head =
+			`${theme.fg(color(m.from), `▌ ${m.from}`)} ${theme.fg("dim", "→")} ${theme.fg(color(m.to), m.to)} ` +
+			theme.fg("dim", `· ${m.id} · ${n(m.text.length)} chars · ${ago(m.at)}`);
+		const extra = messageFlags(m, theme);
+		body.push(truncateToWidth(extra.length ? `${head} ${theme.fg("dim", "·")} ${extra.join(theme.fg("dim", " · "))}` : head, w));
+		for (const para of m.text.split(/\r?\n/)) {
+			if (!para.trim()) {
+				body.push("");
+				continue;
+			}
+			for (const wrapped of wrapTextWithAnsi(para, Math.max(1, w - 2))) body.push(truncateToWidth(`  ${wrapped}`, w));
+		}
+		body.push("");
+	}
+	if (!msgs.length) body.push(theme.fg("dim", "  (thread could not be read)"));
+	return { header: header.map((l) => truncateToWidth(l, w)), body };
+}
+
 function rail(content: string, theme: FleetTheme): string {
 	return `${theme.fg("borderMuted", "│")} ${content}`;
 }
@@ -827,6 +1000,8 @@ export function renderInspector(
 	evs: Ev[],
 	width: number,
 	theme: FleetTheme,
+	/** Messages of the open thread (threadNav.mode "open"); ignored otherwise. */
+	threadMsgs: ThreadMessage[] = [],
 ): { lines: string[]; viewport: number; bodyLines: number; scroll: number; maxScroll: number } {
 	if (width < 36) {
 		return {
@@ -848,7 +1023,14 @@ export function renderInspector(
 
 	let header: string[] = [];
 	let body: string[] = [];
-	if (item?.kind === "team") {
+	const nav = st.threadNav ?? null;
+	const { threads, index: navIndex } = navPosition(st);
+	const openThread = nav?.mode === "open" && navIndex >= 0 ? threads[navIndex] : undefined;
+	if (item && nav?.mode === "pick" && threads.length) {
+		({ header, body } = threadPicker(item, threads, Math.max(0, navIndex), detailWidth, theme));
+	} else if (item && openThread) {
+		({ header, body } = threadMessagesDetail(item, openThread, threadMsgs, `${navIndex + 1}/${threads.length}`, detailWidth, theme));
+	} else if (item?.kind === "team") {
 		({ header, body } = teamDetail(item.team, detailWidth, theme, st.collapsed.has(teamKey(item.team))));
 	} else if (v) {
 		const last = evs.at(-1);
@@ -869,8 +1051,16 @@ export function renderInspector(
 
 	const viewport = Math.max(1, bodyHeight - header.length);
 	const maxScroll = Math.max(0, body.length - viewport);
-	// Following is for live transcripts; a team summary always reads from the top.
-	const scroll = st.autoFollow && item?.kind === "agent" ? maxScroll : Math.min(st.scroll, maxScroll);
+	// Following is for live transcripts and open threads; a team summary
+	// always reads from the top, and the picker keeps its cursor in view.
+	let scroll: number;
+	if (nav?.mode === "pick" && threads.length) {
+		scroll = Math.min(maxScroll, Math.max(0, navIndex - viewport + 1));
+	} else if (st.autoFollow && (openThread || (!nav && item?.kind === "agent"))) {
+		scroll = maxScroll;
+	} else {
+		scroll = Math.min(st.scroll, maxScroll);
+	}
 	const visible = [...header, ...body.slice(scroll, scroll + viewport)];
 
 	const liveCount = st.fleet.filter((f) => f.alive).length;
@@ -881,7 +1071,11 @@ export function renderInspector(
 	const title =
 		` ${theme.bold("Subagent fleet")} ` +
 		theme.fg("dim", `· ${liveCount} live${foreign ? ` (${foreign} elsewhere)` : ""} · $${spend.toFixed(3)}`);
-	const status = v
+	const status = openThread
+		? `${theme.fg("accent", "✉")} ${openThread.id} `
+		: nav?.mode === "pick"
+			? `${theme.fg("accent", "✉")} ${plural(threads.length, "thread")} `
+			: v
 		? `${glyph(v, theme)} ${v.record.agent} · ${stateLabel(v)} `
 		: item?.kind === "team"
 			? `${theme.fg("accent", st.collapsed.has(teamKey(item.team)) ? "▸" : "▾")} ${teamLabel(item.team)} `
@@ -899,8 +1093,13 @@ export function renderInspector(
 	}
 	lines.push(theme.fg("border", `├${"─".repeat(rosterWidth)}┴${"─".repeat(detailWidth)}┤`));
 	const position = st.items.length ? `${st.selected + 1}/${st.items.length}` : "0/0";
+	const follow = `f follow${st.autoFollow ? "*" : ""}`;
 	const footer =
-		` ↑↓/jk select · h/l/⏎ fold · J/K scroll · PgUp/PgDn page · x tools · f follow${st.autoFollow ? "*" : ""} · r refresh · Esc close · ${position}`;
+		nav?.mode === "pick"
+			? ` ↑↓/jk pick thread · ⏎/l open · Esc/h back · q close · ${Math.max(0, navIndex) + 1}/${threads.length}`
+			: openThread
+				? ` ↑↓/jk/J/K scroll · PgUp/PgDn page · [/] prev/next thread · ${follow} · Esc/h back · q close · ${navIndex + 1}/${threads.length}`
+				: ` ↑↓/jk select · h/l/⏎ fold · ${threads.length ? "t threads · " : ""}J/K scroll · PgUp/PgDn page · x tools · ${follow} · r refresh · Esc close · ${position}`;
 	lines.push(theme.fg("border", "│") + fit(theme.fg("dim", footer), inner) + theme.fg("border", "│"));
 	lines.push(theme.fg("border", `╰${"─".repeat(inner)}╯`));
 
@@ -947,6 +1146,15 @@ export function handleInspectorKey(st: InspectorState, data: string, viewport: n
 		// Scrolling back to the bottom resumes following new output.
 		st.autoFollow = st.scroll >= st.maxScroll;
 	};
+	if (st.threadNav) return handleThreadKey(st, st.threadNav, data, viewport, scrollBy);
+	const openPicker = (): KeyResult => {
+		const threads = threadsOf(st.items[st.selected]);
+		if (!threads.length) return { kind: "handled" };
+		st.threadNav = { mode: "pick", threadId: threads[0]!.id };
+		st.scroll = 0;
+		st.autoFollow = false;
+		return { kind: "moved" };
+	};
 	const move = (delta: number): KeyResult => {
 		const next = st.selected + delta;
 		if (next < 0 || next >= st.items.length) return { kind: "handled" };
@@ -985,13 +1193,17 @@ export function handleInspectorKey(st: InspectorState, data: string, viewport: n
 			st.autoFollow = !st.autoFollow;
 			if (!st.autoFollow) st.scroll = st.maxScroll;
 			return { kind: "handled" };
+		case "t":
+			return openPicker();
 		case "\r":
 		case "h":
 		case "l": {
 			const item = st.items[st.selected];
 			if (!item) return { kind: "handled" };
 			if (item.kind === "agent") {
-				// Tree convention: h on a child goes to its parent; l/Enter do nothing.
+				// Tree convention: h on a child goes to its parent. Enter on an
+				// agent picks one of its threads; l does nothing.
+				if (data === "\r") return openPicker();
 				if (data !== "h") return { kind: "handled" };
 				const key = teamKey(item.team);
 				st.selected = Math.max(0, st.items.findIndex((i) => i.kind === "team" && teamKey(i.team) === key));
@@ -1011,6 +1223,102 @@ export function handleInspectorKey(st: InspectorState, data: string, viewport: n
 		}
 		case "r":
 			return { kind: "refresh" };
+		default:
+			return { kind: "ignored" };
+	}
+}
+
+/**
+ * Keys while browsing threads. In the picker, ↑↓/jk move the highlight and
+ * Enter/l opens it. In an open thread, ↑↓/jk scroll a line, J/K a few,
+ * PgUp/PgDn a page, and [ / ] step to the previous/next thread. Esc/h/Backspace
+ * go back one level; q and Ctrl+C still close the whole view.
+ */
+function handleThreadKey(
+	st: InspectorState,
+	nav: ThreadNav,
+	data: string,
+	viewport: number,
+	scrollBy: (delta: number) => void,
+): KeyResult {
+	const { threads, index } = navPosition(st);
+	const leave = (): KeyResult => {
+		if (nav.mode === "open" && threads.length) {
+			st.threadNav = { mode: "pick", threadId: nav.threadId };
+		} else {
+			st.threadNav = null;
+			st.autoFollow = st.items[st.selected]?.kind === "agent";
+		}
+		st.scroll = 0;
+		return { kind: "moved" };
+	};
+	const select = (i: number, mode: ThreadNav["mode"]): KeyResult => {
+		const t = threads[Math.max(0, Math.min(threads.length - 1, i))];
+		if (!t) return leave();
+		const changed = t.id !== nav.threadId || mode !== nav.mode;
+		st.threadNav = { mode, threadId: t.id };
+		if (changed && mode === "open") {
+			// A thread opens at its latest message and follows new ones, like a transcript.
+			st.scroll = 0;
+			st.autoFollow = true;
+		}
+		return { kind: changed ? "moved" : "handled" };
+	};
+	switch (data) {
+		case "q":
+		case "\x03":
+			return { kind: "close" };
+		case "\x1b":
+		case "h":
+		case "\x7f":
+			return leave();
+		case "r":
+			return { kind: "refresh" };
+	}
+	if (nav.mode === "pick") {
+		switch (data) {
+			case "\x1b[A":
+			case "k":
+				return select(index - 1, "pick");
+			case "\x1b[B":
+			case "j":
+				return select(index + 1, "pick");
+			case "\r":
+			case "l":
+				return select(index, "open");
+			default:
+				return { kind: "ignored" };
+		}
+	}
+	switch (data) {
+		case "\x1b[A":
+		case "k":
+			scrollBy(-1);
+			return { kind: "handled" };
+		case "\x1b[B":
+		case "j":
+			scrollBy(1);
+			return { kind: "handled" };
+		case "K":
+			scrollBy(-SCROLL_STEP);
+			return { kind: "handled" };
+		case "J":
+			scrollBy(SCROLL_STEP);
+			return { kind: "handled" };
+		case "\x1b[5~":
+			scrollBy(-Math.max(1, viewport));
+			return { kind: "handled" };
+		case "\x1b[6~":
+			scrollBy(Math.max(1, viewport));
+			return { kind: "handled" };
+		case "[":
+			return index > 0 ? select(index - 1, "open") : { kind: "handled" };
+		case "]":
+			return index < threads.length - 1 ? select(index + 1, "open") : { kind: "handled" };
+		case "f":
+			st.autoFollow = !st.autoFollow;
+			if (!st.autoFollow) st.scroll = st.maxScroll;
+			return { kind: "handled" };
 		default:
 			return { kind: "ignored" };
 	}

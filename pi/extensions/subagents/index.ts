@@ -30,11 +30,15 @@ import {
 	collectTeams,
 	handleInspectorKey,
 	itemKey,
+	navPosition,
+	readThreadMessages,
 	readTranscript,
 	renderInspector,
+	type ThreadMessage,
 	renderPlain,
 } from "./fleet.ts";
 import { buildInfoReport, buildInfoSummary } from "./info.ts";
+import { newChildId, normalizeName, unknownChildText } from "./naming.ts";
 import { type PeekLevel, digest, render, statusLine } from "./peek.ts";
 import {
 	admit,
@@ -743,6 +747,7 @@ export default function (pi: ExtensionAPI) {
 			_id,
 			params: {
 				agent: string;
+				name?: string;
 				task: string;
 				writes?: string[];
 				reads?: string[];
@@ -771,7 +776,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			let team: string;
+			let name: string | undefined;
 			try {
+				name = normalizeName(params.name);
 				team = validateTeam(readRegistry(runDir, runId, root), params.team);
 			} catch (e) {
 				return { content: [{ type: "text", text: (e as Error).message }], isError: true, details: undefined };
@@ -803,10 +810,13 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const id = `c-${Math.random().toString(16).slice(2, 6)}`;
+			// Unique across this run's registry (every generation, finished or not) and
+			// the live map; the admission lock below re-checks before inserting.
+			const id = newChildId(name, new Set([...Object.keys(readRegistry(runDir, runId, root).children), ...live.keys()]));
 			const childDir = path.join(runDir, id);
 			const record: ChildRecord = {
 				id,
+				...(name ? { name } : {}),
 				agent: agent.name,
 				task: params.task,
 				team,
@@ -836,6 +846,7 @@ export default function (pi: ExtensionAPI) {
 				} catch (e) {
 					return { ok: false, reason: (e as Error).message };
 				}
+				if (reg.children[id]) return { ok: false, reason: `Subagent ID ${id} was taken concurrently; spawn again.` };
 				const a = admit(reg, id, writes);
 				if (!a.ok) return a;
 				reg.children[id] = record;
@@ -861,7 +872,7 @@ export default function (pi: ExtensionAPI) {
 							`board: ${path.relative(root, boardPath(runDir))}`,
 					},
 				],
-				details: { id, agent: agent.name, writes, model: record.model, team },
+				details: { id, name, agent: agent.name, writes, model: record.model, team },
 			};
 		},
 	});
@@ -878,7 +889,7 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Unknown subagent "${params.id}". Known: ${[...live.keys()].join(", ") || "(none)"}`,
+							text: unknownChildText(params.id, [...live.values()].map((l) => l.record)),
 						},
 					],
 					isError: true,
@@ -1046,7 +1057,7 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Unknown subagent "${params.id}". Known: ${[...live.keys()].join(", ")}`,
+							text: unknownChildText(params.id, [...live.values()].map((l) => l.record)),
 						},
 					],
 					isError: true,
@@ -1075,7 +1086,7 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Unknown subagent "${params.id}". Known: ${[...live.keys()].join(", ") || "(none)"}`,
+							text: unknownChildText(params.id, [...live.values()].map((l) => l.record)),
 						},
 					],
 					isError: true,
@@ -1119,7 +1130,9 @@ export default function (pi: ExtensionAPI) {
 				.map((id) => live.get(id))
 				.filter((l): l is LiveChild => Boolean(l));
 			if (targets.length === 0) {
-				return { content: [{ type: "text", text: "No matching subagents." }], details: undefined };
+				const unknown = (params.ids ?? []).find((id) => !live.has(id));
+				const text = unknown ? unknownChildText(unknown, [...live.values()].map((l) => l.record)) : "No matching subagents.";
+				return { content: [{ type: "text", text }], details: undefined };
 			}
 
 			const pending = targets.filter((l) => !l.settled);
@@ -1400,24 +1413,31 @@ export default function (pi: ExtensionAPI) {
 					autoFollow: false,
 					expandedTools: false,
 					rows: 32,
+					threadNav: null,
 				};
 				let evs: Ev[] = [];
+				let threadMsgs: ThreadMessage[] = [];
 				let loadedFrom: string | null = null;
 				let viewport = 1;
 
 				// Only the SELECTED child's transcript is parsed, and only its tail, so
 				// opening this on a long-running agent stays cheap. Team rows need none.
+				// While a thread is open, only that thread's file is read instead.
 				const loadDetail = (force = false) => {
 					const item = st.items[st.selected];
-					const file = item?.kind === "agent" ? item.view.sessionFile : null;
+					const { threads, index } = navPosition(st);
+					const thread = st.threadNav?.mode === "open" ? threads[index] : undefined;
+					const file = thread ? thread.file : item?.kind === "agent" ? item.view.sessionFile : null;
 					if (!file) {
 						evs = [];
+						threadMsgs = [];
 						loadedFrom = null;
 						return;
 					}
 					if (!force && file === loadedFrom) return;
 					loadedFrom = file;
-					evs = readTranscript(file);
+					if (thread) threadMsgs = readThreadMessages(file);
+					else evs = readTranscript(file);
 				};
 				loadDetail();
 
@@ -1427,6 +1447,11 @@ export default function (pi: ExtensionAPI) {
 					Object.assign(st, snapshot());
 					const at = st.items.findIndex((i) => itemKey(i) === key);
 					st.selected = at >= 0 ? at : Math.min(st.selected, Math.max(0, st.items.length - 1));
+					// The row being browsed vanished, or its thread did: back to the normal view.
+					if (st.threadNav && (at < 0 || navPosition(st).index < 0)) {
+						st.threadNav = null;
+						st.scroll = 0;
+					}
 					loadDetail(true);
 				};
 
@@ -1445,7 +1470,7 @@ export default function (pi: ExtensionAPI) {
 				const component = {
 					render: (width: number) => {
 						st.rows = tui.terminal?.rows ?? 32;
-						const r = renderInspector(st, evs, width, theme as unknown as FleetTheme);
+						const r = renderInspector(st, evs, width, theme as unknown as FleetTheme, threadMsgs);
 						viewport = r.viewport;
 						st.maxScroll = r.maxScroll;
 						return r.lines;

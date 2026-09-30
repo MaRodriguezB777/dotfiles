@@ -13,6 +13,7 @@ export interface FakeChildOverrides {
 	team?: string;
 	acceptingMessages?: boolean;
 	pid?: number | null;
+	name?: string;
 }
 
 export function tmpRun(): string {

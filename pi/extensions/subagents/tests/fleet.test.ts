@@ -10,6 +10,8 @@ import {
 	collectTeams,
 	handleInspectorKey,
 	type InspectorState,
+	navPosition,
+	readThreadMessages,
 	renderInspector,
 	renderPlain,
 } from "../fleet.ts";
@@ -276,3 +278,159 @@ test("tokens are attributed per message model, and large counts use M", () => {
 		cleanup();
 	}
 });
+
+/* ------------------------------------------------------- thread browsing */
+
+const agentRow = (st: InspectorState, id: string) => st.items.findIndex((i) => i.kind === "agent" && i.view.record.id === id);
+const openMsgs = (st: InspectorState) => {
+	const { threads, index } = navPosition(st);
+	return st.threadNav?.mode === "open" && threads[index] ? readThreadMessages(threads[index].file) : [];
+};
+const view = (st: InspectorState, w = 160) => renderInspector(st, [], w, theme, openMsgs(st)).lines.join("\n");
+
+test("t on an agent lists its threads; Enter opens one and shows its messages", () => {
+	const { root, cleanup } = fixture();
+	try {
+		const st = state(root);
+		st.selected = agentRow(st, "c-a");
+		assert.match(view(st), /t threads/, "footer advertises threads when the row has some");
+		assert.equal(handleInspectorKey(st, "t", 10).kind, "moved");
+		assert.equal(st.threadNav?.mode, "pick");
+		let text = view(st);
+		assert.match(text, /Threads of scout · c-a/);
+		assert.match(text, /› ↔ c-b · t-0\d/);
+		assert.match(text, /t-01 · 2 msgs \(1↑ 1↓\) · 1,000 chars/);
+		assert.match(text, /t-02 · 1 msg \(0↑ 1↓\) · 50 chars · 1 unread/);
+
+		// Highlight t-02 whichever order the threads came in, then open it.
+		while (st.threadNav!.threadId !== "t-02") handleInspectorKey(st, "j", 10);
+		assert.equal(handleInspectorKey(st, "\r", 10).kind, "moved");
+		assert.equal(st.threadNav?.mode, "open");
+		text = view(st);
+		assert.match(text, /c-a ↔ c-b · t-02/);
+		assert.match(text, /▌ c-b → c-a · m-3 · 50 chars · [^\n]*ago · unread/);
+		assert.match(text, /z{50}/);
+		assert.doesNotMatch(text, /x{10}/, "only the opened thread is shown");
+
+		// ] / [ step between threads without leaving the open view.
+		const { index } = navPosition(st);
+		handleInspectorKey(st, index === 0 ? "]" : "[", 10);
+		assert.equal(st.threadNav?.threadId, "t-01");
+		text = view(st);
+		assert.match(text, /▌ c-a → c-b · m-1 · 300 chars/);
+		assert.match(text, /▌ c-b → c-a · m-2 · 700 chars/);
+		assert.ok(text.indexOf("m-1") < text.indexOf("m-2"), "messages in send order");
+
+		// Esc backs out one level at a time; the roster selection never moved.
+		handleInspectorKey(st, "\x1b", 10);
+		assert.equal(st.threadNav?.mode, "pick");
+		assert.equal(st.threadNav?.threadId, "t-01", "picker keeps the thread you were reading");
+		handleInspectorKey(st, "\x1b", 10);
+		assert.equal(st.threadNav, null);
+		assert.equal(st.selected, agentRow(st, "c-a"));
+		assert.equal(st.autoFollow, true, "back on an agent, the transcript follows again");
+		assert.equal(handleInspectorKey(st, "\x1b", 10).kind, "close", "Esc from the normal view still closes");
+	} finally {
+		cleanup();
+	}
+});
+
+test("t on a team browses every team thread; Enter in the picker opens instead of folding", () => {
+	const { root, cleanup } = fixture();
+	try {
+		const st = state(root);
+		st.selected = st.items.findIndex((i) => i.kind === "team" && i.team.name === "audio");
+		handleInspectorKey(st, "t", 10);
+		const text = view(st);
+		assert.match(text, /Threads of team audio/);
+		assert.match(text, /c-a ↔ c-b · t-01/);
+		assert.match(text, /c-a ↔ c-b · t-02/);
+		handleInspectorKey(st, "\r", 10);
+		assert.equal(st.threadNav?.mode, "open");
+		assert.equal(st.collapsed.size, 0, "Enter did not fold the team");
+		assert.equal(handleInspectorKey(st, "q", 10).kind, "close", "q closes the view from inside a thread");
+	} finally {
+		cleanup();
+	}
+});
+
+test("rows without threads ignore t, and Enter on them keeps its old meaning", () => {
+	const { root, cleanup } = fixture();
+	try {
+		const st = state(root);
+		st.selected = agentRow(st, "c-d");
+		assert.doesNotMatch(view(st), /t threads/);
+		handleInspectorKey(st, "t", 10);
+		handleInspectorKey(st, "\r", 10);
+		assert.equal(st.threadNav ?? null, null);
+		st.selected = st.items.findIndex((i) => i.kind === "team" && i.team.name === "ui");
+		handleInspectorKey(st, "t", 10);
+		assert.equal(st.threadNav ?? null, null);
+		handleInspectorKey(st, "\r", 10);
+		assert.ok(st.collapsed.size === 1, "Enter still folds a team");
+	} finally {
+		cleanup();
+	}
+});
+
+test("an open thread scrolls with j/k, follows by default, and every line fits", () => {
+	const { root, cleanup } = fixture();
+	try {
+		const st = state(root);
+		st.rows = 14;
+		st.selected = agentRow(st, "c-a");
+		handleInspectorKey(st, "t", 5);
+		while (st.threadNav!.threadId !== "t-01") handleInspectorKey(st, "j", 5);
+		handleInspectorKey(st, "l", 5);
+		let r = renderInspector(st, [], 60, theme, openMsgs(st));
+		st.maxScroll = r.maxScroll;
+		assert.ok(r.maxScroll > 0, "fixture must overflow");
+		assert.equal(r.scroll, r.maxScroll, "opens following the latest message");
+		handleInspectorKey(st, "k", r.viewport);
+		r = renderInspector(st, [], 60, theme, openMsgs(st));
+		assert.equal(r.scroll, r.maxScroll - 1);
+		assert.equal(st.autoFollow, false);
+		for (const mode of ["pick", "open"] as const) {
+			st.threadNav = { mode, threadId: "t-01" };
+			for (let w = 36; w <= 200; w += 7) {
+				for (const line of renderInspector(st, [], w, theme, openMsgs(st)).lines) assert.ok(visibleWidth(line) <= w, `${mode} w=${w}: ${line}`);
+			}
+		}
+	} finally {
+		cleanup();
+	}
+});
+
+test("readThreadMessages reports delivery and read state per message", () => {
+	const root = mkdtempSync(join(tmpdir(), "fleet-th-"));
+	try {
+		const file = join(root, "t-0a.json");
+		writeFileSync(
+			file,
+			JSON.stringify({
+				version: 1,
+				id: "t-0a",
+				team: "audio",
+				participants: [{ id: "c-a", generation: 1 }, { id: "c-b", generation: 1 }],
+				createdAt: 1,
+				messages: [
+					msg("m-2", "c-b", "c-a", "later", { seq: 2, inbound: { state: "undelivered", at: 1, reason: "c-a has finished" } }),
+					msg("m-1", "c-a", "c-b", "0123456789", { seq: 1, needs_reply: true, read: { ranges: [[0, 4]], full: false, at: 1, session: null } }),
+					msg("m-3", "c-a", "c-b", "q", { seq: 3, reply_to: "m-2", inbound: { state: "queued", at: null, reason: null }, read: { ranges: [], full: false, at: null, session: null } }),
+				],
+			}),
+		);
+		const msgs = readThreadMessages(file);
+		assert.deepEqual(msgs.map((m) => m.id), ["m-1", "m-2", "m-3"], "ordered by seq");
+		assert.equal(msgs[0].readChars, 4);
+		assert.equal(msgs[0].needsReply, true);
+		assert.equal(msgs[1].inbound, "undelivered");
+		assert.equal(msgs[1].inboundReason, "c-a has finished");
+		assert.equal(msgs[2].inbound, "queued");
+		assert.equal(msgs[2].replyTo, "m-2");
+		assert.deepEqual(readThreadMessages(join(root, "missing.json")), []);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+

@@ -8,12 +8,34 @@ estimates):
 
 | tool | purpose |
 | --- | --- |
-| `subagent_spawn` | start a child on a scoped task, optionally with a write claim |
+| `subagent_spawn` | start a child on a scoped task, optionally with a write claim and a `name` |
 | `subagent_peek` | bounded view of a child: `status` / `digest` / `tail` / `final` |
 | `subagent_collect` | wait for children and return their final results |
 | `subagent_followup` | resume a child in its existing session instead of re-explaining context to a fresh one; `interrupt: true` stops a running child and redirects it |
 | `subagent_stop` | stop a running child and release its territory, keeping its transcript |
 | `subagent_team` | define a team and its shared goal; omit arguments to list teams |
+
+## Names and IDs
+
+`subagent_spawn({ name: "cleanup", … })` gives the child the ID
+`cleanup-3a1f`: the name plus a random suffix that is unique within the run.
+Without a name the ID is `c-3a1f`, as before. Names are 1-32 lowercase
+letters, digits, `-` or `_` (uppercase is folded), because the ID is also the
+child's directory name.
+
+The full ID is the only handle. The orchestrator's tools
+(`subagent_peek`/`collect`/`followup`/`stop`) take it, and the widget, cards,
+board, fleet view and every message show it. Passing a bare name to one of
+those tools is refused with the full IDs that carry it:
+`Unknown subagent "cleanup". Subagents are addressed by full ID: cleanup-3a1f, cleanup-9b02.`
+
+The one shortcut is between teammates. `message_team({ to: "cleanup" })`
+reaches `cleanup-3a1f` when it is the only agent named `cleanup` on the
+sender's own team, whatever its state; agents on other teams don't count.
+A tie is refused, never guessed:
+`"cleanup" is ambiguous on team api: cleanup-3a1f, cleanup-9b02. Use the full ID.`
+The message is stored under the full ID, and the tool result names it
+(`Queued m-… in thread t-… for cleanup-3a1f`). Resolution lives in `naming.ts`.
 
 ## Why territory, not files
 
@@ -40,7 +62,7 @@ and gets two tools for talking to **its own team only**:
 
 | tool | behaviour |
 | --- | --- |
-| `message_team({ to, text, reply_to?, needs_reply? })` | message one running teammate; returns immediately. `reply_to` continues a thread. |
+| `message_team({ to, text, reply_to?, needs_reply? })` | message one running teammate; returns immediately. `to` is the full ID or, if unique on the team, just the name. `reply_to` continues a thread. |
 | `team_messages({ thread_id?, view?, cursor? })` | no arguments: thread index with unread counts. `thread_id`: unread incoming messages; `view: "recent"` or `"all"` for history (paged). |
 
 - Messages of ≤2,000 characters are delivered automatically at the next
@@ -65,7 +87,7 @@ ordinary exchanges do not reach the parent's context.
 | --- | --- | --- |
 | widget below the editor | 0 tokens | live status of running children |
 | scrollback card | 0 tokens | one per child at start and finish |
-| `/subagents-fleet` | 0 tokens | full transcript inspector |
+| `/subagents-fleet` | 0 tokens | full transcript and team-thread inspector |
 | completion message | ~40 tokens, triggers a turn | a child finished and its result has not reached you: `Subagent c-x (worker, done) finished. Collect its result with subagent_collect({ ids: ["c-x"] }).` |
 | escalation | triggers a turn | **facts only** — a child that cannot proceed |
 
@@ -83,9 +105,26 @@ to interrupt the agent; it surfaces on the widget and waits to be noticed.
 | command | what it does |
 | --- | --- |
 | `/subagents` | one-line status of the current run |
-| `/subagents-fleet` | live two-pane inspector: roster + transcript, for every child in the repo including other sessions' |
+| `/subagents-fleet` | live two-pane inspector: roster + transcript, for every child in the repo including other sessions'. Hover an agent or team and press `t` (or Enter on an agent) to pick one of its message threads and read it live |
 | `/subagents-info` | opens an editor buffer with the exact prompts, tool schemas and token costs sent to the parent and to children |
 | `/subagents-resume-run` | adopt a previous run so its children can be followed up; restarts nothing on its own |
+
+### Reading team threads in `/subagents-fleet`
+
+With an agent or team row selected, `t` (or Enter on an agent row) opens a
+thread picker in the detail pane. It lists that agent's threads, or every
+thread in the team, with message counts, sent/received, and unread and
+undelivered flags. `↑↓`/`jk` move the highlight and Enter/`l` opens the thread.
+
+An open thread shows every message in send order, including sender →
+recipient, id, size and age. Flags mark `needs reply`, `↩` the message it
+replies to, `queued`, `unread` / `read x/y chars`, and `undelivered` with its
+reason. The view refreshes every second and follows new messages (`f`
+toggles following). `↑↓`/`jk` scroll a line, `J`/`K` three lines,
+`PgUp`/`PgDn` a page, and `[`/`]` step to the previous or next thread.
+Esc/`h` goes back one level (thread → picker → normal view); `q` closes the
+inspector. Like the rest of the view, this only reads the thread files: it
+never marks messages read and costs no tokens.
 
 ## Children do not outlive their parent
 
