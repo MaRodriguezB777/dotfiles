@@ -833,7 +833,19 @@ export default function (pi: ExtensionAPI) {
     clearPoll();
   });
 
+  // Deferred: not declared to the model until tool_search loads them. The
+  // namespace is what tool_search lists as a source in its own description.
+  const LAZY = {
+    exposure: "deferred" as const,
+    namespace: {
+      name: "local_vlm",
+      description:
+        "Local llama.cpp vision-language model: inspect images/video frames, check or load local GGUF models on the GPU.",
+    },
+  };
+
   pi.registerTool({
+    ...LAZY,
     name: "local_llm_status",
     label: "Local LLM Status",
     description:
@@ -936,6 +948,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    ...LAZY,
     name: "local_llm_load",
     label: "Load Local Model",
     description:
@@ -1065,6 +1078,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    ...LAZY,
     name: "local_vlm_query",
     label: "Local VLM",
     description:
