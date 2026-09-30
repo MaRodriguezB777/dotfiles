@@ -3,10 +3,12 @@
  *
  * Interactive checklist to enable/disable individual tools for this session.
  * Each row shows the tool name and the size of its actual JSON definition
- * ("X chars ~ Y tokens"), so you can see what keeping it active costs. Since
- * the active tool list is part of the cached prompt prefix, changing it
- * invalidates the provider's prompt cache for future turns — a warning with
- * the current cached token count is shown before the checklist.
+ * as recorded in the session transcript ("X chars ~ Y tokens"), so you can
+ * see what keeping it active costs. Rows are grouped (by default) into
+ * always-active tools, deferred tools already loaded (e.g. by tool_search),
+ * deferred tools still waiting, and disabled tools; checking a deferred tool
+ * loads it, unchecking unloads it. A warning above the checklist appears
+ * when the change will invalidate the prompt cache for the current model.
  *
  * Pure rendering/sorting/diffing logic lives in tools-toggle-logic.ts so it
  * can be unit tested without the pi-tui runtime; this file only wires that
@@ -20,21 +22,32 @@ import {
 	buildDisplayRows,
 	buildToggleItems,
 	clampViewportStart,
+	describeToggleDiff,
 	diffToggle,
 	findRowForItemIndex,
 	formatCacheWarning,
+	formatContextSummary,
 	formatSortModeLabel,
 	moveCursor,
 	nextSortMode,
 	renderToggleLines,
 	SIDE_PADDING,
 	sortToggleItems,
+	supportsNativeToolChanges,
 	type SortMode,
 	type ToggleItem,
 	type ToggleLineStyle,
 	wrapText,
 } from "./tools-toggle-logic.ts";
-import { renderSingleToolMarkdown, type ToolInfoLike, type ToolsSource } from "./tools.ts";
+import {
+	applyDeclared,
+	type DeclaredToolLike,
+	isDeferredExposure,
+	loadDeclaredTools,
+	renderSingleToolMarkdown,
+	type ToolInfoLike,
+	type ToolsSource,
+} from "./tools.ts";
 
 export function registerToolsToggleCommand(pi: ExtensionAPI): void {
 	pi.registerCommand("prompt:tools-toggle", {
@@ -46,18 +59,25 @@ export function registerToolsToggleCommand(pi: ExtensionAPI): void {
 			}
 
 			const source = pi as unknown as ToolsSource;
-			let items = buildToggleItems(source);
+			let declared: DeclaredToolLike[] | undefined;
+			try {
+				declared = await loadDeclaredTools(ctx);
+			} catch {
+				// Fall back to registered definitions if the transcript can't be replayed.
+			}
+			let items = buildToggleItems(source, declared);
 			if (items.length === 0) {
 				ctx.ui.notify("No tools are configured for this session.", "warning");
 				return;
 			}
 
-			let sortMode: SortMode = "extension";
+			let sortMode: SortMode = "status";
 			items = sortToggleItems(items, sortMode);
 
 			const initialActive = new Set(source.getActiveTools());
 			const cacheTokens = ctx.getContextUsage()?.tokens;
-			const warning = formatCacheWarning(cacheTokens);
+			const nativeToolChanges = supportsNativeToolChanges(ctx.model as { compat?: any } | undefined);
+			const warning = formatCacheWarning(cacheTokens, nativeToolChanges);
 
 			let cursor = 0;
 			let viewportStart = 0;
@@ -73,6 +93,7 @@ export function registerToolsToggleCommand(pi: ExtensionAPI): void {
 						name: (t) => theme.bold(t),
 						size: (t) => theme.fg("muted", t),
 						header: (t) => theme.fg("accent", theme.bold(t)),
+						tag: (t) => theme.fg(t.startsWith("will ") ? "warning" : "dim", t),
 					};
 
 					const viewCurrentToolDocs = async () => {
@@ -80,7 +101,9 @@ export function registerToolsToggleCommand(pi: ExtensionAPI): void {
 						viewingDocs = true;
 						try {
 							const currentName = items[cursor]?.name;
-							const fullTool = (pi.getAllTools() as ToolInfoLike[]).find((t) => t.name === currentName);
+							const fullTool = applyDeclared(pi.getAllTools() as ToolInfoLike[], declared).find(
+								(t) => t.name === currentName,
+							);
 							if (!fullTool) {
 								ctx.ui.notify(`Could not find tool definition for "${currentName}".`, "error");
 								return;
@@ -103,12 +126,13 @@ export function registerToolsToggleCommand(pi: ExtensionAPI): void {
 							// isn't crammed against the overlay's edges (same buffer used for
 							// the sort-status line and group headers via SIDE_PADDING).
 							const wrapWidth = Math.max(10, width - SIDE_PADDING.length * 2);
-							const warningLines = wrapText(`⚠ ${warning}`, wrapWidth);
+							const warningLines = warning ? wrapText(`⚠ ${warning}`, wrapWidth) : [];
 
 							const lines: string[] = [];
 							for (const line of warningLines) {
 								lines.push(theme.fg("warning", theme.bold(`${SIDE_PADDING}${line}`)));
 							}
+							lines.push(theme.fg("muted", `${SIDE_PADDING}${formatContextSummary(items)}`));
 							lines.push(theme.fg("dim", `${SIDE_PADDING}${formatSortModeLabel(sortMode)}`));
 							lines.push("");
 							lines.push(...renderToggleLines(rows, items, cursor, viewportStart, viewportSize, style));
@@ -116,7 +140,7 @@ export function registerToolsToggleCommand(pi: ExtensionAPI): void {
 							lines.push(
 								theme.fg(
 									"dim",
-									"↑↓/jk move (wraps) · space toggle · a all on · z all off · v view tool docs · s sort · enter apply · esc cancel",
+									"↑↓/jk move · space toggle/load · a all up-front on · d unload deferred · z all off · v docs · s sort · enter apply · esc cancel",
 								),
 							);
 							return lines;
@@ -147,7 +171,13 @@ export function registerToolsToggleCommand(pi: ExtensionAPI): void {
 								return;
 							}
 							if (data === "a") {
-								for (const item of items) item.active = true;
+								// Up-front tools only: turning on every deferred tool would defeat deferral.
+								for (const item of items) if (!isDeferredExposure(item.exposure)) item.active = true;
+								tui.requestRender();
+								return;
+							}
+							if (data === "d") {
+								for (const item of items) if (isDeferredExposure(item.exposure)) item.active = false;
 								tui.requestRender();
 								return;
 							}
@@ -189,10 +219,13 @@ export function registerToolsToggleCommand(pi: ExtensionAPI): void {
 
 			pi.setActiveTools(finalActive);
 
-			const parts: string[] = [];
-			if (added.length > 0) parts.push(`enabled: ${added.join(", ")}`);
-			if (removed.length > 0) parts.push(`disabled: ${removed.join(", ")}`);
-			ctx.ui.notify(`Tools updated (${parts.join("; ")}). Prompt cache invalidated.`, "warning");
+			const summary = describeToggleDiff({ added, removed, finalActive }, result);
+			ctx.ui.notify(
+				nativeToolChanges
+					? `Tools updated (${summary}). Sent as a mid-conversation tool change.`
+					: `Tools updated (${summary}). Prompt cache invalidated.`,
+				nativeToolChanges ? "info" : "warning",
+			);
 		},
 	});
 }

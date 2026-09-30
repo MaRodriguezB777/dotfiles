@@ -15,28 +15,74 @@ the editor closes.
 
 ### `/prompt:tools`
 
-Renders every **active** tool definition as readable markdown instead of raw
-JSON schema and opens it the same way. For each tool you get:
+Renders the session's tool definitions as readable markdown instead of raw
+JSON schema and opens it the same way. Since pi 0.9x a tool has an
+`exposure`, so tools are split by where they stand relative to the model's
+context:
+
+| Section                  | Exposure                  | In context? | Rendering      |
+|--------------------------|---------------------------|-------------|----------------|
+| **Always active**        | `direct` / `model-only`   | yes         | full sections  |
+| **Loaded from deferral** | `deferred` / `codemode`, activated (e.g. by `tool_search`) | yes | full sections |
+| **Deferred, not loaded** | `deferred` / `codemode`, still waiting | no | list grouped by namespace, with would-be sizes |
+| **Disabled**             | `direct`, turned off      | no          | list with sizes |
+| **Hidden**               | `hidden`                  | no (unreachable) | names only |
+
+The summary at the top gives the in-context count and total size (always
+active vs. loaded), plus how much loading every deferred tool would add.
+"In context" comes from the transcript's tool declarations, so it is what
+the model has actually been sent. Where that differs from the active set,
+a *Pending* note lists what the next request will add or drop. Tools the
+transcript declares that aren't registered in this session (e.g. MCP tools
+before their server connects) are called out too. With codemode active in
+`codemode.mode: "only"`, a note warns that direct tools' declarations are
+hidden from requests.
+
+For each tool with a full section you get:
 
 - a heading annotated with the size of the *actual* JSON definition sent to
   the model, e.g. `## bash  (1234 chars ~ 309 tokens)` — measured from
   `JSON.stringify({name, description, parameters})`, tokens estimated at
   ~4 chars/token
 - source metadata (builtin/extension, scope, file path)
+- exposure and namespace, for anything that isn't plain `direct`
 - the full description
 - parameters as a nested bullet list with type, `required`, defaults, enum
   values, and nested object properties (up to 3 levels deep)
 - prompt guidelines (`string[]`), rendered as a bullet list, when a tool
   declares them
 
-Configured-but-inactive tools are listed at the bottom with their would-be
-sizes, so you can see what enabling them would cost.
 
 ### `/prompt:tools-toggle`
 
 Opens an interactive checklist overlay to enable/disable individual tools
-for the current session. Each row is a `[x]`/`[ ]` checkbox with the tool's
-name and the size of its actual JSON definition right there, e.g.:
+for the current session. Checking a deferred tool **loads** it, as
+`tool_search` would; unchecking a loaded one **unloads** it back to
+deferred. `hidden` tools are not listed, because they can't be activated.
+By default rows are grouped by context status when the overlay opened:
+
+```
+  In context: 18 tools (14870 chars ~ 3718 tokens) (15 always, 3 loaded) · 0 deferred · 8 disabled
+  Sorted by context status
+
+  Always active  (10995 chars ~ 2749 tokens):
+    › [x] bash    (512 chars ~ 128 tokens)
+  Loaded from deferral  (3875 chars ~ 969 tokens):
+      [x] local_vlm_query  (1941 chars ~ 485 tokens)  loaded
+  Deferred, not loaded  (...):
+      [x] mcp_thing  (...)  will load
+  Disabled  (...):
+      [ ] grep    (1008 chars ~ 252 tokens)
+```
+
+Deferred tools carry a `deferred`/`loaded` tag. Any row whose checkbox
+differs from how it opened is tagged `will enable` / `will disable` /
+`will load` / `will unload` instead. Groups are keyed on the *initial*
+status, so rows don't jump between groups as you toggle. The `In context:`
+line updates live with your selections.
+
+In the extension sort mode, each row is a `[x]`/`[ ]` checkbox with the
+tool's name and the size of its actual JSON definition, e.g.:
 
 ```
   pi system  (2145 chars ~ 536 tokens):
@@ -63,8 +109,14 @@ No tool descriptions are shown in the list — press `v` on a tool to see
 those (see below). Keeping the list to name + size makes it easy to scan
 for "what's expensive" without extra clutter.
 
-Before the checklist, a warning is shown, word-wrapped to the overlay width
-with a 2-column buffer on each side so it never runs edge-to-edge:
+Before the checklist, a cache warning may be shown, word-wrapped to the overlay
+width with a 2-column buffer on each side so it never runs edge-to-edge.
+Since pi 0.9x, tool changes are appended to the transcript as system
+messages. Models that accept mid-conversation `tool_addition` /
+`tool_removal` blocks (`model.compat.supportsMidConvoSystemMessages` and
+`supportsMidConvoToolChanges`, e.g. current Anthropic models) keep the
+cached prefix, so no notice is shown. For other models pi sends a full
+checkpoint, and the warning is shown:
 
 > &nbsp;&nbsp;⚠ Toggling tools will invalidate the prompt cache (~12,345
 > tokens currently cached).
@@ -83,10 +135,11 @@ Controls:
 | `↑` / `k`   | Move up (wraps from the first tool to the last)     |
 | `↓` / `j`   | Move down (wraps from the last tool to the first)   |
 | `space`     | Toggle the highlighted tool                         |
-| `a`         | Turn all tools on                                   |
-| `z`         | Turn all tools off                                  |
+| `a`         | Turn all up-front (non-deferred) tools on — deferred tools are left alone |
+| `d`         | Unload every deferred tool                          |
+| `z`         | Turn all tools off (disables and unloads everything) |
 | `v`         | View the highlighted tool's full docs in `$EDITOR`  |
-| `s`         | Cycle sort: by extension ↔ by token count           |
+| `s`         | Cycle sort: by status → by extension → by token count |
 | `enter`     | Apply the changes                                   |
 | `esc`       | Cancel — no changes are made                        |
 
@@ -101,10 +154,14 @@ a read-only `$EDITOR` buffer — exactly like `/prompt:system` and
 `/prompt:tools` do. Closing the editor returns you to the checklist with
 your selections intact.
 
-**`s` — sort mode.** Cycles between two orderings; the status line under the
-warning always shows which one is active (`Sorted by extension` /
-`Sorted by token count`):
-- **By extension** (default): tools are grouped under a header for their
+**`s` — sort mode.** Cycles between three orderings; the status line under the
+warning always shows which one is active (`Sorted by context status` /
+`Sorted by extension` / `Sorted by token count`):
+- **By context status** (default): groups *Always active*, *Loaded from
+  deferral*, *Deferred, not loaded*, *Disabled*, each header with its
+  aggregate size (for the deferred group, what loading them all would add).
+  Tools within a group are alphabetical.
+- **By extension**: tools are grouped under a header for their
   owning extension, rendered as an indented subpoint list under each
   header, with the header showing that extension's aggregate token size.
   **`pi system`** (builtin tools) is always the first group; the rest are
@@ -120,8 +177,10 @@ first), the group's header scrolls into view along with it, so you're never
 left looking at a tool with no idea which extension it belongs to.
 
 On apply, it calls `pi.setActiveTools(...)` with the new set and reports a
-summary (`enabled: ...; disabled: ...`) plus a reminder that the cache was
-invalidated. If nothing actually changed, it no-ops with a plain notice.
+summary (`enabled: ...; loaded: ...; disabled: ...; unloaded: ...`), plus
+either a cache-invalidated warning or, on models with native mid-conversation
+tool changes, an info notice. If nothing actually changed, it no-ops with a
+plain notice.
 
 ## Files
 
@@ -183,6 +242,21 @@ it, since the header sits one row earlier and fell outside the window. Fix:
 reveals an earlier row, also walks upward through any header rows that
 directly precede it so the header comes into view too.
 
+**Deferred tools aren't in `getActiveTools()` until loaded.** Since pi
+0.9x, `getAllTools()` returns every registered tool with its `exposure` and
+`namespace`. `deferred` and `codemode` tools are registered *inactive* and
+only become active (declared to the model) when `tool_search`, or
+`pi.setActiveTools()`, adds them. An inactive tool is therefore not
+necessarily "disabled". `toolStatus(exposure, inContext)` in `tools.ts`
+makes the distinction, and both commands use it.
+
+**Resuming a session doesn't re-activate tool_search loads (pi 0.99.1).**
+`createAgentSession` always passes an initial tool list, so
+`_restoreToolsFromTranscript()` never runs on startup. After `-c`/resume,
+tools the transcript still declares show up in `/prompt:tools` as *Pending,
+dropped from the next request*. That is pi's behaviour, reported
+accurately, not a bug in this extension.
+
 ## Tests
 
 The rendering, diffing, and size helpers are pure functions, so they are
@@ -217,6 +291,12 @@ Requires Node ≥ 23 (native TypeScript type stripping); on Node 22 add
 - `renderSingleToolMarkdown` (used by `/prompt:tools-toggle`'s `v` key)
   renders the same heading/source/description/parameters/guidelines content
   as one tool's block in the aggregate view, for one tool in isolation
+
+- deferral: `toolStatus` classification for every exposure; the
+  always / loaded / deferred / disabled / hidden sections appear in order,
+  with full sections only for in-context tools and deferred tools grouped
+  by namespace; transcript-based classification with a pending
+  `tool_search` load; the `codemode.mode: "only"` warning
 
 ### `tests/tools-toggle-logic.test.ts` (`/prompt:tools-toggle`)
 
@@ -258,6 +338,12 @@ Requires Node ≥ 23 (native TypeScript type stripping); on Node 22 add
   both directions, **and** pulls a group header into view when scrolling
   up lands on that group's first tool (but not when the target row isn't a
   group's first tool)
+- deferral: `buildToggleItems` records exposure/initial status and skips
+  `hidden` tools; status sort order and headers; groups stay stable while
+  toggling; `toggleItemTag` (`deferred`/`loaded`, `will …` for pending
+  changes); `formatContextSummary`; `describeToggleDiff` splits
+  enable/disable from load/unload; the cache notice follows
+  `supportsNativeToolChanges(model)`
 - `wrapText` greedily wraps to the given width without breaking words,
   collapses internal whitespace/newlines, and returns `[]` for blank input
   (used to word-wrap the cache warning with side padding in the real UI)

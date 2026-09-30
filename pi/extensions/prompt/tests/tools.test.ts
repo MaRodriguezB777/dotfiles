@@ -95,7 +95,7 @@ test("renderToolsMarkdown includes active tools with size annotations", () => {
 
 	// Header counts only active tools.
 	assert.match(md, /^# Tool definitions in this session's prompt/);
-	assert.match(md, /2 active tool\(s\), total JSON size \(\d+ chars ~ \d+ tokens\)/);
+	assert.match(md, /2 tool\(s\) in context \(2 always active, 0 loaded from deferral\), total JSON size \(\d+ chars ~ \d+ tokens\)/);
 
 	// Per-tool heading carries the real JSON size.
 	assert.match(md, new RegExp(`## bash {2}\\(${toolJsonSize(bashTool)} chars ~ \\d+ tokens\\)`));
@@ -146,7 +146,7 @@ test("renderToolsMarkdown handles tools without parameters", () => {
 test("renderToolsMarkdown lists inactive tools separately", () => {
 	const md = renderToolsMarkdown(makeSource(["bash"], [bashTool, hiddenTool]));
 
-	assert.match(md, /## Inactive tools \(1, not in the prompt\)/);
+	assert.match(md, /## Disabled tools \(1, not in the prompt\)/);
 	assert.match(md, /- hidden_tool {2}\(\d+ chars ~ \d+ tokens\)/);
 	// Inactive tool must not get a full section.
 	assert.doesNotMatch(md, /## hidden_tool/);
@@ -154,7 +154,7 @@ test("renderToolsMarkdown lists inactive tools separately", () => {
 
 test("renderToolsMarkdown with no inactive tools omits the inactive section", () => {
 	const md = renderToolsMarkdown(makeSource(["bash"], [bashTool]));
-	assert.doesNotMatch(md, /Inactive tools/);
+	assert.doesNotMatch(md, /Disabled tools/);
 });
 
 test("renderSingleToolMarkdown renders one tool's full doc (used by /prompt:tools-toggle's 'v' key)", () => {
@@ -178,4 +178,113 @@ test("renderToolsMarkdown total equals the sum of active tool sizes", () => {
 	const md = renderToolsMarkdown(makeSource(["bash", "read"], [bashTool, readTool]));
 	const total = toolJsonSize(bashTool) + toolJsonSize(readTool);
 	assert.match(md, new RegExp(`total JSON size \\(${total} chars ~ ${estimateTokens(total)} tokens\\)`));
+});
+
+import { replayDeclaredTools } from "../tools.ts";
+
+test("replayDeclaredTools returns undefined when no system message declares tools", () => {
+	assert.equal(replayDeclaredTools([{ role: "user", content: "hi" }, { role: "system", content: "" }]), undefined);
+});
+
+test("replayDeclaredTools applies removals before additions, in order", () => {
+	const out = replayDeclaredTools([
+		{ role: "system", toolsAdded: [{ name: "a", description: "a1" }, { name: "codemode", description: "old" }] },
+		{ role: "user", content: "x" },
+		{ role: "system", toolsRemoved: [{ name: "a" }, { name: "codemode" }], toolsAdded: [{ name: "codemode", description: "new" }] },
+	]);
+	assert.deepEqual(out, [{ name: "codemode", description: "new" }]);
+});
+
+test("renderToolsMarkdown prefers transcript declarations over registered descriptions", () => {
+	const registered: ToolInfoLike = { name: "codemode", description: "short", sourceInfo: { source: "builtin" } };
+	const md = renderToolsMarkdown(makeSource(["codemode"], [registered]), [
+		{ name: "codemode", description: "LONG PREPARED DESCRIPTION" },
+	]);
+	assert.match(md, /LONG PREPARED DESCRIPTION/);
+	assert.doesNotMatch(md, /\nshort\n/);
+	assert.match(md, /Source: builtin/);
+	assert.match(md, /recorded in the session transcript/);
+});
+
+test("renderToolsMarkdown reports pending active-set changes and inactive tools", () => {
+	const md = renderToolsMarkdown(makeSource(["bash", "read"], [bashTool, readTool, hiddenTool]), [
+		{ name: "bash", description: "b" },
+		{ name: "gone", description: "g" },
+	]);
+	assert.match(md, /next request: \+read/);
+	assert.match(md, /dropped from the next request: -gone/);
+	assert.match(md, /Disabled tools \(2/);
+});
+
+// ---- tool deferral (pi >= 0.9x exposure) ----
+
+const vlmNs = { name: "local_vlm", description: "Local vision model.\nSecond line." };
+const vlmQuery: ToolInfoLike = {
+	name: "local_vlm_query",
+	description: "Ask the VLM",
+	exposure: "deferred",
+	namespace: vlmNs,
+	sourceInfo: { source: "local", path: "/x/local-vlm/index.ts" },
+};
+const vlmStatus: ToolInfoLike = { ...vlmQuery, name: "local_llm_status", description: "Status" };
+const mcpTool: ToolInfoLike = { name: "mcp_thing", description: "MCP", exposure: "codemode" };
+const toolSearch: ToolInfoLike = { name: "tool_search", description: "Search", exposure: "model-only" };
+const ghost: ToolInfoLike = { name: "ghost", description: "gone", exposure: "hidden" };
+
+import { isDeferredExposure, toolStatus } from "../tools.ts";
+
+test("toolStatus classifies exposure x in-context", () => {
+	assert.equal(toolStatus(undefined, true), "always");
+	assert.equal(toolStatus("direct", false), "disabled");
+	assert.equal(toolStatus("model-only", true), "always");
+	assert.equal(toolStatus("deferred", true), "loaded");
+	assert.equal(toolStatus("deferred", false), "deferred");
+	assert.equal(toolStatus("codemode", false), "deferred");
+	assert.equal(toolStatus("hidden", true), "hidden");
+	assert.equal(isDeferredExposure("codemode"), true);
+	assert.equal(isDeferredExposure("direct"), false);
+});
+
+test("renderToolsMarkdown separates always-active, loaded, deferred, disabled and hidden tools", () => {
+	const md = renderToolsMarkdown(
+		makeSource(["bash", "tool_search", "local_vlm_query"], [bashTool, readTool, toolSearch, vlmQuery, vlmStatus, mcpTool, ghost]),
+	);
+	assert.match(md, /3 tool\(s\) in context \(2 always active, 1 loaded from deferral\)/);
+	assert.match(md, /2 deferred tool\(s\) not loaded \(\(\d+ chars ~ \d+ tokens\) if all were loaded\), 1 disabled\./);
+
+	const always = md.indexOf("# Always active (2)");
+	const loaded = md.indexOf("# Loaded from deferral (1)");
+	const deferred = md.indexOf("## Deferred, not loaded (2, not in the prompt)");
+	const disabled = md.indexOf("## Disabled tools (1, not in the prompt)");
+	const hidden = md.indexOf("## Hidden tools (1, registered but unreachable)");
+	assert.ok(always >= 0 && always < loaded && loaded < deferred && deferred < disabled && disabled < hidden);
+
+	// Loaded deferred tool gets a full section with its exposure/namespace.
+	assert.match(md, /## local_vlm_query {2}\(\d+ chars/);
+	assert.match(md, /\*Exposure: deferred · namespace: local_vlm\*/);
+	// Waiting deferred tools are listed (grouped by namespace), not given sections.
+	assert.doesNotMatch(md, /## local_llm_status/);
+	assert.match(md, /- \*\*local_vlm\*\* {2}\(\d+ chars ~ \d+ tokens\) — Local vision model\.\n {2}- local_llm_status/);
+	assert.match(md, /\n- mcp_thing {2}\(/);
+	assert.match(md, /- read {2}\(/);
+	assert.match(md, /- ghost\n/);
+});
+
+test("renderToolsMarkdown classifies by transcript declarations and flags a pending tool_search load", () => {
+	const md = renderToolsMarkdown(makeSource(["bash", "local_vlm_query"], [bashTool, vlmQuery]), [
+		{ name: "bash", description: "b" },
+	]);
+	assert.match(md, /1 tool\(s\) in context \(1 always active, 0 loaded from deferral\)/);
+	assert.match(md, /next request: \+local_vlm_query/);
+	assert.match(md, /Deferred, not loaded \(1/);
+});
+
+test("renderToolsMarkdown warns when codemode.mode is only", () => {
+	const source: ToolsSource = {
+		getActiveTools: () => ["bash", "codemode"],
+		getAllTools: () => [bashTool, { name: "codemode", description: "c", exposure: "model-only" }],
+		getSettings: () => ({ codemode: { mode: "only" } }),
+	};
+	assert.match(renderToolsMarkdown(source), /codemode\.mode is "only"/);
+	assert.doesNotMatch(renderToolsMarkdown(makeSource(["bash"], [bashTool])), /codemode\.mode/);
 });

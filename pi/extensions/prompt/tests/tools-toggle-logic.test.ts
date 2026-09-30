@@ -140,14 +140,16 @@ test("sortToggleItems in tokens mode sorts by size descending, ties broken by na
 	);
 });
 
-test("nextSortMode cycles between extension and tokens", () => {
+test("nextSortMode cycles status -> extension -> tokens -> status", () => {
+	assert.equal(nextSortMode("status"), "extension");
 	assert.equal(nextSortMode("extension"), "tokens");
-	assert.equal(nextSortMode("tokens"), "extension");
+	assert.equal(nextSortMode("tokens"), "status");
 });
 
 test("formatSortModeLabel is a short, plain label", () => {
 	assert.equal(formatSortModeLabel("extension"), "Sorted by extension");
 	assert.equal(formatSortModeLabel("tokens"), "Sorted by token count");
+	assert.equal(formatSortModeLabel("status"), "Sorted by context status");
 });
 
 test("formatCacheWarning includes a formatted token count when known", () => {
@@ -364,4 +366,102 @@ test("wrapText collapses internal whitespace/newlines and trims", () => {
 test("wrapText returns an empty array for blank input", () => {
 	assert.deepEqual(wrapText("", 40), []);
 	assert.deepEqual(wrapText("   ", 40), []);
+});
+
+test("buildToggleItems sizes use transcript declarations when provided", () => {
+	const registered = { name: "codemode", description: "short", sourceInfo: { source: "builtin" } };
+	const src = { getActiveTools: () => ["codemode"], getAllTools: () => [registered, { name: "idle", description: "x" }] };
+	const plain = buildToggleItems(src as any);
+	const declared = buildToggleItems(src as any, [{ name: "codemode", description: "L".repeat(5000) }]);
+	assert.ok(declared.find((i) => i.name === "codemode")!.sizeChars > 5000);
+	assert.ok(plain.find((i) => i.name === "codemode")!.sizeChars < 200);
+	assert.equal(declared.find((i) => i.name === "idle")!.sizeChars, plain.find((i) => i.name === "idle")!.sizeChars);
+	assert.equal(declared.find((i) => i.name === "codemode")!.groupLabel, "pi system");
+});
+
+// ---- tool deferral (pi >= 0.9x exposure) ----
+
+import {
+	describeToggleDiff,
+	formatContextSummary,
+	supportsNativeToolChanges,
+	toggleItemTag,
+} from "../tools-toggle-logic.ts";
+
+const dVlm: ToolInfoLike = { name: "vlm", description: "v", exposure: "deferred", sourceInfo: { source: "local", path: "/e/local-vlm/index.ts" } };
+const dMcp: ToolInfoLike = { name: "mcp", description: "m", exposure: "codemode", sourceInfo: { source: "builtin" } };
+const dHidden: ToolInfoLike = { name: "ghost", description: "g", exposure: "hidden" };
+
+function deferralItems(): ToggleItem[] {
+	return buildToggleItems(makeSource(["bash", "vlm"], [bash, read, dVlm, dMcp, dHidden]));
+}
+
+test("buildToggleItems records exposure and initial status, and skips hidden tools", () => {
+	const items = deferralItems();
+	const by = Object.fromEntries(items.map((i) => [i.name, i]));
+	assert.equal(by.ghost, undefined);
+	assert.equal(by.bash.initialStatus, "always");
+	assert.equal(by.read.initialStatus, "disabled");
+	assert.equal(by.vlm.initialStatus, "loaded");
+	assert.equal(by.mcp.initialStatus, "deferred");
+	assert.equal(by.vlm.exposure, "deferred");
+});
+
+test("status sort groups always -> loaded -> deferred -> disabled with headers", () => {
+	const items = sortToggleItems(deferralItems(), "status");
+	assert.deepEqual(items.map((i) => i.name), ["bash", "vlm", "mcp", "read"]);
+	const headers = buildDisplayRows(items, "status")
+		.filter((r) => r.kind === "header")
+		.map((r) => (r as { label: string }).label);
+	assert.deepEqual(headers, ["Always active", "Loaded from deferral", "Deferred, not loaded", "Disabled"]);
+});
+
+test("status groups stay put when a tool is toggled (grouped by initial status)", () => {
+	const items = sortToggleItems(deferralItems(), "status");
+	items.find((i) => i.name === "mcp")!.active = true;
+	assert.deepEqual(sortToggleItems(items, "status").map((i) => i.name), ["bash", "vlm", "mcp", "read"]);
+});
+
+test("toggleItemTag shows deferred/loaded state and pending changes", () => {
+	const by = Object.fromEntries(deferralItems().map((i) => [i.name, i]));
+	assert.equal(toggleItemTag(by.bash), "");
+	assert.equal(toggleItemTag(by.vlm), "loaded");
+	assert.equal(toggleItemTag(by.mcp), "deferred");
+	by.mcp.active = true;
+	by.vlm.active = false;
+	by.bash.active = false;
+	by.read.active = true;
+	assert.equal(toggleItemTag(by.mcp), "will load");
+	assert.equal(toggleItemTag(by.vlm), "will unload");
+	assert.equal(toggleItemTag(by.bash), "will disable");
+	assert.equal(toggleItemTag(by.read), "will enable");
+	assert.match(renderToggleItemLine(by.mcp, false), /\[x\] mcp {2}\(\d+ chars ~ \d+ tokens\) {2}will load$/);
+	assert.match(renderToggleItemLine(by.bash, true, { cursorLine: (t) => `<${t}>` }), /will disable>$/);
+});
+
+test("formatContextSummary counts what the current checkboxes put in context", () => {
+	const items = deferralItems();
+	const inCtx = items.filter((i) => i.active).reduce((s, i) => s + i.sizeChars, 0);
+	assert.equal(
+		formatContextSummary(items),
+		`In context: 2 tools (${inCtx} chars ~ ${Math.round(inCtx / 4)} tokens) (1 always, 1 loaded) · 1 deferred · 1 disabled`,
+	);
+});
+
+test("describeToggleDiff splits enable/disable from load/unload", () => {
+	const items = deferralItems();
+	const out = describeToggleDiff({ added: ["read", "mcp"], removed: ["bash", "vlm"], finalActive: [] }, items);
+	assert.equal(out, "enabled: read; loaded: mcp; disabled: bash; unloaded: vlm");
+});
+
+test("cache warning reflects native mid-conversation tool changes", () => {
+	assert.equal(supportsNativeToolChanges(undefined), undefined);
+	assert.equal(supportsNativeToolChanges({}), false);
+	assert.equal(supportsNativeToolChanges({ compat: { supportsMidConvoToolChanges: true } }), false);
+	assert.equal(
+		supportsNativeToolChanges({ compat: { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true } }),
+		true,
+	);
+	assert.equal(formatCacheWarning(1000, true), "");
+	assert.match(formatCacheWarning(1000, false), /will invalidate the prompt cache/);
 });

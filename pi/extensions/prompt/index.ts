@@ -2,10 +2,12 @@
  * prompt/ extension — inspect what pi actually sends to the model.
  *
  *   /prompt:system         view the session system prompt read-only in $EDITOR
- *   /prompt:tools          view all active tool definitions, pretty-printed with
- *                          the true JSON size of each ("X chars ~ Y tokens")
- *   /prompt:tools-toggle   interactively enable/disable tools for this session
- *                          (warns that this invalidates the prompt cache)
+ *   /prompt:tools          view tool definitions, pretty-printed with the true
+ *                          JSON size of each ("X chars ~ Y tokens"), split into
+ *                          always active / loaded from deferral / deferred /
+ *                          disabled
+ *   /prompt:tools-toggle   interactively enable/disable (or load/unload deferred)
+ *                          tools for this session
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
