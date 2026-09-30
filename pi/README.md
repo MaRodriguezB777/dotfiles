@@ -27,6 +27,7 @@ Source lives in [`extensions/`](extensions/).
 | [`prompt/`](extensions/prompt/) | Inspect and adjust what pi actually sends: `/prompt:system` dumps the real system prompt into `$EDITOR` read-only, plus tool-listing and per-tool enable/disable commands. |
 | [`rtk/`](extensions/rtk/) | Routes bash tool calls through `rtk rewrite` to cut command output tokens. Fails open: if `rtk` is missing or errors, the original command runs unchanged. Requires [`rtk`](https://github.com/rtk-ai/rtk) on `PATH` (`curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh \| sh`). |
 | [`subagents/`](extensions/subagents/) | Spawn, supervise and resume child pi sessions. Territory claims (glob write-scopes) are enforced inside each child so parallel agents cannot overwrite each other; teams share a goal and message each other directly; the parent is woken when a child finishes; children stand down when the parent dies and survive `/reload`. `/subagents-fleet` is a live transcript inspector, `/subagents-info` dumps the exact prompts and token costs, `/subagents-resume-run` adopts a previous run. See its [README](extensions/subagents/README.md). |
+| [`web-access-codemode/`](extensions/web-access-codemode/) | Loads `pi-web-access` with its tools exposed only through `codemode` (under a `web` namespace) instead of declared up front. Requires the npm package installed and its own entry disabled in `settings.json`: `{ "source": "npm:pi-web-access", "extensions": ["-dist/index.js"] }`. |
 | [`auto-session-name.ts`](extensions/auto-session-name.ts) | Renames the session every 5 user messages via claude-haiku, as `<broad goal> ---- <current goal>`. `/rename-now` forces it. |
 | [`monitors.ts`](extensions/monitors.ts) | Background cron-style monitors: run a command on an interval and either notify or wake the agent with the output. |
 | [`omarchy-system-theme.ts`](extensions/omarchy-system-theme.ts) | Follows the active Omarchy theme, flipping pi between light and dark. |
@@ -46,10 +47,11 @@ pi install npm:@shuv1337/pi-mcp-adapter
 ```
 
 `pi install` records these in `~/.pi/agent/settings.json` under `packages`
-(not tracked here, since that file also holds machine-local state). Two of
+(not tracked here, since that file also holds machine-local state). Three of
 them need resource filters in that entry to match this setup:
-`pi-claude-oauth-adapter` enables `+extensions/index.ts`, and
-`@danielmeneses/pi-llama-swap` disables `-index.ts`.
+`pi-claude-oauth-adapter` enables `+extensions/index.ts`,
+`@danielmeneses/pi-llama-swap` disables `-index.ts`, and `pi-web-access`
+disables `-dist/index.js` (it is loaded by `web-access-codemode` instead).
 
 | package | what it does |
 | --- | --- |
