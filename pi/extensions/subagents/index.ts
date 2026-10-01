@@ -52,7 +52,7 @@ import {
 	writeRegistry,
 } from "./registry.ts";
 import { launch } from "./spawn.ts";
-import { widgetLines } from "./widget.ts";
+import { type PanelInput, SubagentPanel, panelLines } from "./widget.ts";
 import { createCompletionNotifier } from "./completion.ts";
 import { HANDOFF_VERSION, claimSink, leave, routeChildEvent, take } from "./handoff.ts";
 import { defineTeam, validateTeam, closeInbox, settleMessages, summary as messageSummary } from "./messaging/index.ts";
@@ -196,43 +196,119 @@ export default function (pi: ExtensionAPI) {
 		safely(renderWidget);
 	}
 
-	function renderWidget(): void {
-		if (!uiCtx?.hasUI) return;
-		const running = [...live.values()].filter((l) => l.record.state === "running");
-		if (running.length === 0) {
-			uiCtx.ui.setWidget("subagents", undefined);
-			return;
-		}
-		// Spend is cumulative over every child this session, including finished
-		// ones. Summing only the running set makes the total visibly drop each
-		// time a child exits, which reads as a bug even though it is only a
-		// display choice.
-		const spent = [...live.values()].reduce((sum, l) => sum + (l.usage.cost ?? 0), 0);
-		const lines = widgetLines({
-			running: running.map((l) => {
-				// Advisories are shown here and nowhere else until asked for: visible
-				// if you look, silent if you do not.
+	/**
+	 * The panel above the editor (widget.ts). It stays PANEL_LINGER_MS after the
+	 * last child finishes so the outcome is visible, then gets out of the way.
+	 */
+	const PANEL_LINGER_MS = 10_000;
+	let panel: SubagentPanel | null = null;
+	let panelMounted = false;
+	let panelHide: NodeJS.Timeout | null = null;
+	/**
+	 * /subagents-fleet is open. It replaces the editor but widgets above it stay,
+	 * so the panel would push the fleet past the bottom of the terminal; it shows
+	 * the same information anyway.
+	 */
+	let fleetOpen = false;
+
+	function panelInput(): PanelInput {
+		return {
+			now: Date.now(),
+			// Spend is cumulative over every child this session, including finished
+			// ones; summing only the running set would make the total drop as
+			// children exit.
+			spent: [...live.values()].reduce((sum, l) => sum + (l.usage.cost ?? 0), 0),
+			children: [...live.values()].map((l) => {
+				// Advisories are shown here and nowhere else until asked for:
+				// visible if you look, silent if you do not.
 				const adv = advisories.get(l.record.id);
+				const t = l.activeTool;
 				return {
 					id: l.record.id,
 					agent: l.record.agent,
+					team: l.record.team ?? "none",
+					state: l.record.state,
 					writes: l.record.writes,
 					startedAt: l.startedAt,
-					tool: l.tools.at(-1)?.name,
+					endedAt: l.record.endedAt,
+					...(l.tracksActivity
+						? {
+								toolCount: l.toolCalls ?? 0,
+								// Per process: a follow-up relaunches pi, which loads again.
+								begun: l.begunAt !== undefined,
+							}
+						: {
+								// Adopted from older code: only its finished-tool trace is kept up to date.
+								lastTool: l.tools.length
+									? {
+											text: `${l.tools[l.tools.length - 1].name} ${l.tools[l.tools.length - 1].brief}`.trim(),
+											at: l.tools[l.tools.length - 1].at,
+										}
+									: undefined,
+							}),
+					cost: l.usage.cost,
+					activity: t ? `${t.name}${t.brief ? ` ${t.brief}` : ""}` : undefined,
 					advisory: adv?.length ? adv[adv.length - 1].detail : undefined,
 				};
 			}),
-			done: live.size - running.length,
-			spent,
-			now: Date.now(),
-		});
-		uiCtx.ui.setWidget("subagents", lines, { placement: "belowEditor" });
+		};
+	}
+
+	function hidePanel(): void {
+		uiCtx?.ui.setWidget("subagents", undefined);
+		panelMounted = false;
+		panel = null;
+	}
+
+	function renderWidget(): void {
+		if (!uiCtx?.hasUI) return;
+		if (fleetOpen) {
+			if (panelMounted) hidePanel();
+			return;
+		}
+		const anyRunning = [...live.values()].some((l) => l.record.state === "running");
+		if (anyRunning) {
+			if (panelHide) clearTimeout(panelHide);
+			panelHide = null;
+		} else {
+			if (!panelMounted) return;
+			if (!panelHide) {
+				panelHide = setTimeout(() => {
+					panelHide = null;
+					safely(hidePanel);
+				}, PANEL_LINGER_MS);
+				panelHide.unref?.();
+			}
+		}
+		if (uiCtx.mode !== "tui") {
+			// No component support (RPC): a static snapshot, redrawn on events.
+			const plain = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+			uiCtx.ui.setWidget("subagents", panelLines(panelInput(), 100, plain), { placement: "aboveEditor" });
+			panelMounted = true;
+			return;
+		}
+		if (panelMounted && panel) {
+			panel.refresh();
+			return;
+		}
+		uiCtx.ui.setWidget(
+			"subagents",
+			(tui, theme) => {
+				panel = new SubagentPanel(tui, theme, panelInput);
+				return panel;
+			},
+			{ placement: "aboveEditor" },
+		);
+		panelMounted = true;
 	}
 
 	// Refresh the captured ctx at every opportunity, so a replaced session gets a
 	// live one rather than leaving the widget permanently disabled.
 	pi.on("session_start", (_event, ctx) => {
 		uiCtx = ctx;
+		// A new session has its own widget area: mount the panel afresh.
+		panelMounted = false;
+		panel = null;
 		bindRoot(ctx.cwd);
 		bindTrust(ctx);
 		refreshWidget();
@@ -1402,96 +1478,103 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await ctx.ui.custom<void>((tui, theme, _keys, done) => {
-				const st: InspectorState = {
-					...snapshot(),
-					collapsed,
-					selected: 0,
-					scroll: 0,
-					maxScroll: 0,
-					// Row 0 is a team header, which reads from the top.
-					autoFollow: false,
-					expandedTools: false,
-					rows: 32,
-					threadNav: null,
-				};
-				let evs: Ev[] = [];
-				let threadMsgs: ThreadMessage[] = [];
-				let loadedFrom: string | null = null;
-				let viewport = 1;
+			fleetOpen = true;
+			refreshWidget();
+			try {
+				await ctx.ui.custom<void>((tui, theme, _keys, done) => {
+					const st: InspectorState = {
+						...snapshot(),
+						collapsed,
+						selected: 0,
+						scroll: 0,
+						maxScroll: 0,
+						// Row 0 is a team header, which reads from the top.
+						autoFollow: false,
+						expandedTools: false,
+						rows: 32,
+						threadNav: null,
+					};
+					let evs: Ev[] = [];
+					let threadMsgs: ThreadMessage[] = [];
+					let loadedFrom: string | null = null;
+					let viewport = 1;
 
-				// Only the SELECTED child's transcript is parsed, and only its tail, so
-				// opening this on a long-running agent stays cheap. Team rows need none.
-				// While a thread is open, only that thread's file is read instead.
-				const loadDetail = (force = false) => {
-					const item = st.items[st.selected];
-					const { threads, index } = navPosition(st);
-					const thread = st.threadNav?.mode === "open" ? threads[index] : undefined;
-					const file = thread ? thread.file : item?.kind === "agent" ? item.view.sessionFile : null;
-					if (!file) {
-						evs = [];
-						threadMsgs = [];
-						loadedFrom = null;
-						return;
-					}
-					if (!force && file === loadedFrom) return;
-					loadedFrom = file;
-					if (thread) threadMsgs = readThreadMessages(file);
-					else evs = readTranscript(file);
-				};
-				loadDetail();
-
-				// Keep the same row selected across refreshes even as the order changes.
-				const refresh = () => {
-					const key = itemKey(st.items[st.selected]);
-					Object.assign(st, snapshot());
-					const at = st.items.findIndex((i) => itemKey(i) === key);
-					st.selected = at >= 0 ? at : Math.min(st.selected, Math.max(0, st.items.length - 1));
-					// The row being browsed vanished, or its thread did: back to the normal view.
-					if (st.threadNav && (at < 0 || navPosition(st).index < 0)) {
-						st.threadNav = null;
-						st.scroll = 0;
-					}
-					loadDetail(true);
-				};
-
-				const redraw = () => {
-					tui.requestRender();
-				};
-
-				// Children are separate processes; nothing notifies us when they act,
-				// so the view polls. The roster scan is incremental and only the open
-				// transcript is re-read.
-				const timer = setInterval(() => {
-					refresh();
-					redraw();
-				}, 1000);
-
-				const component = {
-					render: (width: number) => {
-						st.rows = tui.terminal?.rows ?? 32;
-						const r = renderInspector(st, evs, width, theme as unknown as FleetTheme, threadMsgs);
-						viewport = r.viewport;
-						st.maxScroll = r.maxScroll;
-						return r.lines;
-					},
-					invalidate: () => {},
-					dispose: () => clearInterval(timer),
-					handleInput: (data: string) => {
-						const r = handleInspectorKey(st, data, viewport);
-						if (r.kind === "ignored") return;
-						if (r.kind === "close") {
-							clearInterval(timer);
-							done();
+					// Only the SELECTED child's transcript is parsed, and only its tail, so
+					// opening this on a long-running agent stays cheap. Team rows need none.
+					// While a thread is open, only that thread's file is read instead.
+					const loadDetail = (force = false) => {
+						const item = st.items[st.selected];
+						const { threads, index } = navPosition(st);
+						const thread = st.threadNav?.mode === "open" ? threads[index] : undefined;
+						const file = thread ? thread.file : item?.kind === "agent" ? item.view.sessionFile : null;
+						if (!file) {
+							evs = [];
+							threadMsgs = [];
+							loadedFrom = null;
 							return;
 						}
-						if (r.kind === "moved") loadDetail();
-						if (r.kind === "refresh") refresh();
+						if (!force && file === loadedFrom) return;
+						loadedFrom = file;
+						if (thread) threadMsgs = readThreadMessages(file);
+						else evs = readTranscript(file);
+					};
+					loadDetail();
+
+					// Keep the same row selected across refreshes even as the order changes.
+					const refresh = () => {
+						const key = itemKey(st.items[st.selected]);
+						Object.assign(st, snapshot());
+						const at = st.items.findIndex((i) => itemKey(i) === key);
+						st.selected = at >= 0 ? at : Math.min(st.selected, Math.max(0, st.items.length - 1));
+						// The row being browsed vanished, or its thread did: back to the normal view.
+						if (st.threadNav && (at < 0 || navPosition(st).index < 0)) {
+							st.threadNav = null;
+							st.scroll = 0;
+						}
+						loadDetail(true);
+					};
+
+					const redraw = () => {
+						tui.requestRender();
+					};
+
+					// Children are separate processes; nothing notifies us when they act,
+					// so the view polls. The roster scan is incremental and only the open
+					// transcript is re-read.
+					const timer = setInterval(() => {
+						refresh();
 						redraw();
-					},
-				};
-				return component;
-			});
+					}, 1000);
+
+					const component = {
+						render: (width: number) => {
+							st.rows = tui.terminal?.rows ?? 32;
+							const r = renderInspector(st, evs, width, theme as unknown as FleetTheme, threadMsgs);
+							viewport = r.viewport;
+							st.maxScroll = r.maxScroll;
+							return r.lines;
+						},
+						invalidate: () => {},
+						dispose: () => clearInterval(timer),
+						handleInput: (data: string) => {
+							const r = handleInspectorKey(st, data, viewport);
+							if (r.kind === "ignored") return;
+							if (r.kind === "close") {
+								clearInterval(timer);
+								done();
+								return;
+							}
+							if (r.kind === "moved") loadDetail();
+							if (r.kind === "refresh") refresh();
+							redraw();
+						},
+					};
+					return component;
+				});
+			} finally {
+				fleetOpen = false;
+				refreshWidget();
+			}
 		},
 	});
 
@@ -1692,8 +1775,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (event) => {
 		if (escalationTimer) clearInterval(escalationTimer);
 		escalationTimer = null;
+		if (panelHide) clearTimeout(panelHide);
+		panelHide = null;
 		safely(() => {
-			if (uiCtx?.hasUI) uiCtx.ui.setWidget("subagents", undefined);
+			if (uiCtx?.hasUI) hidePanel();
 		});
 		// A collect cannot outlive its instance; end it rather than leave it hanging.
 		for (const c of [...inflightCollects]) c.resolve(null);

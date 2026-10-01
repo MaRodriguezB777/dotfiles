@@ -85,7 +85,7 @@ ordinary exchanges do not reach the parent's context.
 
 | channel | cost | used for |
 | --- | --- | --- |
-| widget below the editor | 0 tokens | live status of running children |
+| panel above the editor | 0 tokens | live tree of children by team: spinner, current tool, overflow counts |
 | scrollback card | 0 tokens | one per child at start and finish |
 | `/subagents-fleet` | 0 tokens | full transcript and team-thread inspector |
 | completion message | ~40 tokens, triggers a turn | a child finished and its result has not reached you: `Subagent c-x (worker, done) finished. Collect its result with subagent_collect({ ids: ["c-x"] }).` |
@@ -98,7 +98,30 @@ the result. Children finishing within a second share one message, and children
 you stopped are never announced.
 
 Nothing that is merely a *guess* about a child (the "stuck" heuristic) is allowed
-to interrupt the agent; it surfaces on the widget and waits to be noticed.
+to interrupt the agent; it surfaces on the panel and waits to be noticed.
+
+The panel looks like this, and disappears 10s after the last child finishes:
+
+```
+⠹ Subagents · 4 running · 3 done · $12.40
+├─ audio  2 running · 1 done
+│  ├─ ⠹ c-2ce6 worker · 3 tools · 1m 12s
+│  │  └ bash npm test
+│  ├─ ✓ c-36ef scout · 9 tools · 4m 02s
+│  └─ +2 more
+└─ +1 more team (3 agents)
+```
+
+Teams are listed busiest first (children without a team last, or one flat list
+when nobody has a team), within 13 lines. Every shown team gets the same number
+of members (up to 3), added one round at a time; teams that do not fit at all
+are counted as `+N more teams`. The panel hides while `/subagents-fleet` is open. In a terminal
+under 36 rows or 64 columns it shows one line per team instead:
+`├─ ⠹ jepa  4 agents · $78.25 · 9h 37m`.
+
+In `/subagents-fleet`, an agent's detail starts with every task it was given
+(the spawn task, then each follow-up, in full); `g` jumps there, `G` back to
+the live end. `x` expands tool calls to the whole call, wrapped.
 
 ## Commands
 

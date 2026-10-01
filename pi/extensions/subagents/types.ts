@@ -81,6 +81,18 @@ export interface LiveChild {
 	/** Cumulative across all generations, so cost never appears to reset. */
 	usage: Usage;
 	tools: ToolTrace[];
+	/** Tool calls this process made (`tools` is only the last few). */
+	toolCalls?: number;
+	/**
+	 * Set by the launching code when its event handler maintains begunAt,
+	 * activeTool and toolCalls. A child adopted across /reload keeps the
+	 * handler of the code that launched it, which may not.
+	 */
+	tracksActivity?: boolean;
+	/** Set when the child's agent loop starts; before that pi is still loading. */
+	begunAt?: number;
+	/** The tool executing right now; undefined while the model is thinking. */
+	activeTool?: { name: string; brief: string; at: number };
 	/** Last few finalized messages, already truncated at capture time. */
 	tail: { role: string; text: string; at: number }[];
 	lastText: string;

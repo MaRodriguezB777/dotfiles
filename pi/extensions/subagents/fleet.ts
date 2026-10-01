@@ -46,6 +46,8 @@ export interface ChildView {
 	lastText: string;
 	lastAt: number;
 	sessionFile: string | null;
+	/** Every task given to the child: spawn task, then follow-ups, in order. */
+	tasks: string[];
 	/** Team message counts; human display only, never sent to a model. */
 	messages: MessageCounts;
 	/** Threads this child takes part in. */
@@ -186,7 +188,13 @@ interface Scan {
 	toolCount: number;
 	lastText: string;
 	lastAt: number;
+	/** Every task the child was given: the spawn task, then each follow-up. */
+	tasks: string[];
 }
+
+/** Bounds memory for pathological transcripts; real children get a handful. */
+const MAX_TASKS = 50;
+const MAX_TASK_CHARS = 20_000;
 
 /**
  * Transcripts are append-only and reach megabytes, so the roster scan parses
@@ -206,7 +214,24 @@ function emptyScan(): Scan {
 		toolCount: 0,
 		lastText: "",
 		lastAt: 0,
+		tasks: [],
 	};
+}
+
+function readBytes(file: string, from: number, to: number): Buffer {
+	try {
+		const fd = fs.openSync(file, "r");
+		try {
+			const len = Math.max(0, to - from);
+			const buf = Buffer.allocUnsafe(len);
+			const n = fs.readSync(fd, buf, 0, len, from);
+			return buf.subarray(0, n);
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return Buffer.alloc(0);
+	}
 }
 
 function readFrom(file: string, from: number, to: number): string {
@@ -240,16 +265,21 @@ function scanSession(file: string): Scan {
 			? {
 					...prev,
 					usage: { ...prev.usage },
+					tasks: [...prev.tasks],
 					byModel: Object.fromEntries(
 						Object.entries(prev.byModel).map(([k, v]) => [k, { cost: v.cost, usage: { ...v.usage } }]),
 					),
 				}
 			: emptyScan();
 
+	// Only whole lines are consumed: a child mid-write leaves a partial last
+	// line, which is read on a later poll once complete instead of skipped.
+	let consumed = from;
 	if (stat.size > from) {
-		const chunk = readFrom(file, from, stat.size);
-		const lines = chunk.split("\n");
-		lines.pop(); // a partial trailing line is normal while a child is writing
+		const buf = readBytes(file, from, stat.size);
+		const end = buf.lastIndexOf(0x0a);
+		consumed = end < 0 ? from : from + end + 1;
+		const lines = end < 0 ? [] : buf.subarray(0, end).toString("utf8").split("\n");
 		for (const line of lines) {
 			if (!line.trim()) continue;
 			let e: any;
@@ -262,6 +292,14 @@ function scanSession(file: string): Scan {
 			const m = e.message;
 			const at = Date.parse(m?.timestamp ?? e.timestamp ?? "") || 0;
 			if (at > acc.lastAt) acc.lastAt = at;
+			if (m?.role === "user") {
+				const text = (m.content ?? [])
+					.filter((p: any) => p?.type === "text" && typeof p.text === "string")
+					.map((p: any) => p.text)
+					.join("\n")
+					.trim();
+				if (text && acc.tasks.length < MAX_TASKS) acc.tasks.push(text.slice(0, MAX_TASK_CHARS));
+			}
 			if (m?.role === "assistant") {
 				acc.turns++;
 				const c = m.usage?.cost?.total;
@@ -290,7 +328,7 @@ function scanSession(file: string): Scan {
 			}
 		}
 	}
-	acc.size = stat.size;
+	acc.size = consumed;
 	if (!acc.lastAt) acc.lastAt = stat.mtimeMs;
 	scanCache.set(file, acc);
 	return acc;
@@ -352,6 +390,7 @@ export function collectFleet(root: string, currentRunId: string | null): ChildVi
 				turns: scan.turns,
 				toolCount: scan.toolCount,
 				lastText: scan.lastText,
+				tasks: scan.tasks.length ? scan.tasks : [record.task],
 				lastAt: scan.lastAt || record.endedAt || record.startedAt,
 				sessionFile,
 				messages: countsFor(record.id, threads, dir),
@@ -436,7 +475,17 @@ export function itemKey(item: Item | undefined): string {
 export type Ev =
 	| { kind: "user"; text: string }
 	| { kind: "assistant"; text: string }
-	| { kind: "tool"; name: string; args: string; output: string; isError: boolean; ms: number };
+	| {
+			kind: "tool";
+			name: string;
+			/** One-line summary for the collapsed view. */
+			args: string;
+			/** The whole call, line breaks kept, for the expanded view (x). */
+			call: string;
+			output: string;
+			isError: boolean;
+			ms: number;
+	  };
 
 const TAIL_BYTES = 64 * 1024;
 const MAX_EVENTS = 200;
@@ -459,7 +508,7 @@ export function readTranscript(file: string): Ev[] {
 	if (from > 0) lines.shift(); // partial first line after seeking mid-file
 
 	const evs: Ev[] = [];
-	const pending = new Map<string, { name: string; args: string; at: number }>();
+	const pending = new Map<string, { name: string; args: string; call: string; at: number }>();
 	for (const line of lines) {
 		if (!line.trim()) continue;
 		let e: any;
@@ -483,6 +532,7 @@ export function readTranscript(file: string): Ev[] {
 				kind: "tool",
 				name: call?.name ?? m.toolName ?? "tool",
 				args: call?.args ?? "",
+				call: call?.call ?? "",
 				output: String(text ?? ""),
 				isError: Boolean(m.isError),
 				ms: call?.at && at ? at - call.at : 0,
@@ -491,7 +541,12 @@ export function readTranscript(file: string): Ev[] {
 		}
 		for (const part of m?.content ?? []) {
 			if (part?.type === "toolCall") {
-				pending.set(part.id, { name: part.name, args: briefArgs(part.name, part.arguments), at });
+				pending.set(part.id, {
+					name: part.name,
+					args: briefArgs(part.name, part.arguments),
+					call: fullCall(part.name, part.arguments),
+					at,
+				});
 			} else if (part?.type === "text" && typeof part.text === "string" && part.text.trim()) {
 				evs.push({ kind: m.role === "user" ? "user" : "assistant", text: part.text.trim() });
 			}
@@ -500,9 +555,24 @@ export function readTranscript(file: string): Ev[] {
 	// Still-running calls have no result yet; show them so a working agent is
 	// not silent in the view.
 	for (const [, c] of pending) {
-		evs.push({ kind: "tool", name: c.name, args: c.args, output: "", isError: false, ms: -1 });
+		evs.push({ kind: "tool", name: c.name, args: c.args, call: c.call, output: "", isError: false, ms: -1 });
 	}
 	return evs.slice(-MAX_EVENTS);
+}
+
+/**
+ * The whole call as text: bash shows its command as written; other tools one
+ * "key: value" per argument, multi-line values continuing on their own lines.
+ */
+function fullCall(name: string, args: any): string {
+	if (!args || typeof args !== "object") return "";
+	if (name === "bash" && typeof args.command === "string") {
+		const rest = Object.entries(args).filter(([k]) => k !== "command");
+		return [args.command, ...rest.map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)].join("\n");
+	}
+	return Object.entries(args)
+		.map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+		.join("\n");
 }
 
 function briefArgs(name: string, args: any): string {
@@ -951,6 +1021,24 @@ function rail(content: string, theme: FleetTheme): string {
 	return `${theme.fg("borderMuted", "│")} ${content}`;
 }
 
+/** Call lines shown when expanded; a huge write/edit should not bury everything. */
+const MAX_CALL_LINES = 60;
+
+/** Every task the agent was given, in full, oldest first. */
+function tasksSection(tasks: string[], width: number, theme: FleetTheme): string[] {
+	const w = Math.max(8, width);
+	const out = [theme.fg("accent", `Tasks · ${tasks.length}`)];
+	tasks.forEach((task, i) => {
+		out.push(truncateToWidth(theme.fg("accent", i === 0 ? "▌ Initial task" : `▌ Follow-up ${i}`), w));
+		for (const para of task.split(/\n/)) {
+			if (!para.trim()) continue;
+			for (const wrapped of wrapTextWithAnsi(para, Math.max(1, w - 2))) out.push(truncateToWidth(`  ${wrapped}`, w));
+		}
+	});
+	out.push("", theme.fg("dim", "── transcript ──"));
+	return out;
+}
+
 function detailBody(evs: Ev[], width: number, theme: FleetTheme, expandedTools: boolean): string[] {
 	const out: string[] = [];
 	const w = Math.max(8, width);
@@ -962,7 +1050,22 @@ function detailBody(evs: Ev[], width: number, theme: FleetTheme, expandedTools: 
 				ev.name === "bash"
 					? theme.fg("toolTitle", theme.bold(`$ ${ev.args}`))
 					: `${theme.fg("toolTitle", theme.bold(ev.name))}${ev.args ? ` ${theme.fg("dim", ev.args)}` : ""}`;
-			out.push(truncateToWidth(rail(`${g} ${head}`, theme), w));
+			const callLines = ev.call.replace(/\s+$/, "").split(/\r?\n/);
+			if (expandedTools && ev.call && (callLines.length > 1 || visibleWidth(`${g} ${head}`) + 2 > w)) {
+				// The headline would be cut: show the name, then the whole call wrapped.
+				out.push(truncateToWidth(rail(`${g} ${theme.fg("toolTitle", theme.bold(ev.name === "bash" ? "$" : ev.name))}`, theme), w));
+				const shownCall = callLines.slice(0, MAX_CALL_LINES);
+				for (const cl of shownCall) {
+					for (const wrapped of wrapTextWithAnsi(theme.fg("toolTitle", cl || " "), Math.max(1, w - 4))) {
+						out.push(truncateToWidth(rail(`  ${wrapped}`, theme), w));
+					}
+				}
+				if (callLines.length > shownCall.length) {
+					out.push(truncateToWidth(rail(theme.fg("dim", `  … ${callLines.length - shownCall.length} more lines of call`), theme), w));
+				}
+			} else {
+				out.push(truncateToWidth(rail(`${g} ${head}`, theme), w));
+			}
 			const body = ev.output.replace(/\s+$/, "").split(/\r?\n/).filter(Boolean);
 			const shown = expandedTools ? body.slice(0, 40) : body.slice(0, 3);
 			for (const line of shown) {
@@ -1043,8 +1146,11 @@ export function renderInspector(
 						? "task"
 						: "no activity";
 		header = detailHeader(v, detailWidth, theme, convo);
-		body = detailBody(evs, detailWidth, theme, st.expandedTools);
-		if (!body.length) body = [theme.fg("dim", "  (no transcript yet)")];
+		const convoBody = detailBody(evs, detailWidth, theme, st.expandedTools);
+		body = [
+			...tasksSection(v.tasks, detailWidth, theme),
+			...(convoBody.length ? convoBody : [theme.fg("dim", "  (no transcript yet)")]),
+		];
 	} else {
 		header = [theme.fg("dim", " No subagents found under .pi/runs/")];
 	}
@@ -1099,7 +1205,7 @@ export function renderInspector(
 			? ` ↑↓/jk pick thread · ⏎/l open · Esc/h back · q close · ${Math.max(0, navIndex) + 1}/${threads.length}`
 			: openThread
 				? ` ↑↓/jk/J/K scroll · PgUp/PgDn page · [/] prev/next thread · ${follow} · Esc/h back · q close · ${navIndex + 1}/${threads.length}`
-				: ` ↑↓/jk select · h/l/⏎ fold · ${threads.length ? "t threads · " : ""}J/K scroll · PgUp/PgDn page · x tools · ${follow} · r refresh · Esc close · ${position}`;
+				: ` ↑↓/jk select · h/l/⏎ fold · ${threads.length ? "t threads · " : ""}J/K scroll · g tasks · G end · x tools · ${follow} · r refresh · Esc close · ${position}`;
 	lines.push(theme.fg("border", "│") + fit(theme.fg("dim", footer), inner) + theme.fg("border", "│"));
 	lines.push(theme.fg("border", `╰${"─".repeat(inner)}╯`));
 
@@ -1195,6 +1301,15 @@ export function handleInspectorKey(st: InspectorState, data: string, viewport: n
 			return { kind: "handled" };
 		case "t":
 			return openPicker();
+		// Top of the detail (an agent's task list) and back to the live bottom.
+		case "g":
+			st.scroll = 0;
+			st.autoFollow = false;
+			return { kind: "handled" };
+		case "G":
+			st.scroll = st.maxScroll;
+			st.autoFollow = true;
+			return { kind: "handled" };
 		case "\r":
 		case "h":
 		case "l": {

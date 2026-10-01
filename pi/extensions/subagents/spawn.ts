@@ -98,6 +98,8 @@ export function newLive(record: ChildRecord, seedUsage?: Usage): LiveChild {
 		record,
 		usage: seedUsage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
 		tools: [],
+		toolCalls: 0,
+		tracksActivity: true,
 		tail: [],
 		lastText: "",
 		lastEventAt: Date.now(),
@@ -226,10 +228,17 @@ export function launch(opts: LaunchOptions): { proc: ChildProcess; live: LiveChi
 			// see what the tool was actually called WITH. Without this every read
 			// collapses to the signature "read:" and three reads of three different
 			// files look like a loop.
+			// The child's loop is running: pi and its extensions finished loading.
+			case "agent_start":
+				live.begunAt ??= Date.now();
+				break;
+
 			case "tool_execution_start":
+				live.begunAt ??= Date.now();
+				live.activeTool = { name: event.toolName, brief: briefArgs(event.toolName, event.args), at: Date.now() };
 				if (typeof event.toolCallId === "string") {
 					pendingArgs.set(event.toolCallId, {
-						brief: briefArgs(event.toolName, event.args),
+						brief: live.activeTool.brief,
 						sig: fullArgs(event.args),
 					});
 					if (pendingArgs.size > MAX_PENDING_ARGS) {
@@ -241,6 +250,8 @@ export function launch(opts: LaunchOptions): { proc: ChildProcess; live: LiveChi
 			case "tool_execution_end": {
 				const pend = pendingArgs.get(event.toolCallId);
 				pendingArgs.delete(event.toolCallId);
+				// Parallel tool calls: only clear when the one shown is the one ending.
+				if (!pendingArgs.size || live.activeTool?.name === event.toolName) live.activeTool = undefined;
 				const trace: ToolTrace = {
 					name: event.toolName,
 					brief: pend?.brief ?? "",
@@ -249,6 +260,7 @@ export function launch(opts: LaunchOptions): { proc: ChildProcess; live: LiveChi
 				};
 				live.tools.push(trace);
 				if (live.tools.length > MAX_TOOL_TRACE) live.tools.shift();
+				live.toolCalls = (live.toolCalls ?? 0) + 1;
 
 				live.consecutiveErrors = trace.isError ? live.consecutiveErrors + 1 : 0;
 				// Repeat detection must compare EVERY argument, not just the headline
@@ -295,6 +307,7 @@ export function launch(opts: LaunchOptions): { proc: ChildProcess; live: LiveChi
 			}
 
 			case "agent_end":
+				live.activeTool = undefined;
 				onEvent(live, "agent_end");
 				break;
 		}
