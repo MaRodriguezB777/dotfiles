@@ -44,3 +44,14 @@ test('board exposes team goals and membership, legacy children default to none',
     assert.match(board, /none/);
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
+
+test("message_team: thread and new_thread, no reply_to; team_messages: with and thread", () => {
+	const send = text.MESSAGE_TEAM_SPEC.parameters.properties;
+	assert.ok(send.thread && send.new_thread && send.needs_reply);
+	assert.equal(send.reply_to, undefined);
+	const read = text.TEAM_MESSAGES_SPEC.parameters.properties;
+	assert.ok(read.with && read.thread && read.view && read.cursor);
+	assert.equal(read.thread_id, undefined);
+	assert.match(text.MESSAGE_TEAM_SPEC.description, /default thread/);
+	assert.match(text.MESSAGE_TEAM_SPEC.description, /new_thread/);
+});

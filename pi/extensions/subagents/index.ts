@@ -55,7 +55,32 @@ import { launch } from "./spawn.ts";
 import { type PanelInput, SubagentPanel, panelLines } from "./widget.ts";
 import { createCompletionNotifier } from "./completion.ts";
 import { HANDOFF_VERSION, claimSink, leave, routeChildEvent, take } from "./handoff.ts";
-import { defineTeam, validateTeam, closeInbox, settleMessages, summary as messageSummary } from "./messaging/index.ts";
+import {
+	abortRestart,
+	beginRestart,
+	closeInbox,
+	defineTeam,
+	finishRestart,
+	settleMessages,
+	summary as messageSummary,
+	validateTeam,
+} from "./messaging/index.ts";
+
+/** Completes "<agent> …" in a failure notice, for a child that ended in `state`. */
+function endedClause(state: string): string {
+	switch (state) {
+		case "done":
+			return "has finished";
+		case "failed":
+			return "failed";
+		case "killed":
+			return "was stopped by the parent";
+		case "orphaned":
+			return "lost its parent session";
+		default:
+			return `ended (${state})`;
+	}
+}
 import { reconcileSessionFile } from "./team-runtime.ts";
 import { COLLECT_SPEC, FOLLOWUP_SPEC, PEEK_SPEC, SPAWN_SPEC, STOP_SPEC, TEAM_SPEC } from "./text.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -397,7 +422,7 @@ export default function (pi: ExtensionAPI) {
 		if (ended) {
 			// Acknowledge what the session actually persisted, then fail the rest.
 			safely(() => reconcileSessionFile(runDir, record.sessionFile));
-			safely(() => settleMessages(runDir, record.id, record.generation, record.state === "done" ? "recipient finished; only the parent can resume it" : `recipient ${record.state}`));
+			safely(() => settleMessages(runDir, record.id, record.generation, endedClause(record.state)));
 		}
 		writeBoard(runDir, reg, countLines(path.join(runDir, "findings.jsonl")));
 	}
@@ -418,12 +443,19 @@ export default function (pi: ExtensionAPI) {
 	 * disk, so subagent_followup can resume the same session afterwards. A stop
 	 * is a pause with the claim released, not a delete.
 	 */
-	async function stopChild(l: LiveChild, reason: string): Promise<void> {
+	/**
+	 * `restart`: the caller resumes this child right after (follow-up with
+	 * interrupt). Its mail is then kept for the next generation instead of
+	 * failed; the caller must finishRestart or abortRestart.
+	 */
+	async function stopChild(l: LiveChild, reason: string, opts: { restart?: boolean } = {}): Promise<void> {
 		stoppedByParent.add(`${l.record.id}:${l.record.generation}`);
-		// Close first so a send racing the stop is refused rather than queued for a
-		// child that will never read it.
 		safely(() => reconcileSessionFile(runDir, l.record.sessionFile));
-		safely(() => closeInbox(runDir, { id: l.record.id, generation: l.record.generation }, "stopped by parent"));
+		const me = { id: l.record.id, generation: l.record.generation };
+		if (opts.restart) safely(() => beginRestart(runDir, me.id, me.generation));
+		// A real stop closes first, so a send racing it is refused rather than
+		// queued for a child that will never read it.
+		else safely(() => closeInbox(runDir, me, "was stopped by the parent"));
 		const proc = procs.get(l.record.id);
 		if (proc) {
 			const signalGroup = (sig: NodeJS.Signals) => {
@@ -991,11 +1023,18 @@ export default function (pi: ExtensionAPI) {
 				}
 				// Stop it where it stands; the session file survives, so the resume
 				// below picks up everything it had already worked out.
-				await stopChild(l, `interrupted by follow-up: ${params.task.replace(/\s+/g, " ").slice(0, 120)}`);
+				await stopChild(l, `interrupted by follow-up: ${params.task.replace(/\s+/g, " ").slice(0, 120)}`, {
+					restart: true,
+				});
 				interrupted = true;
 			}
-			void interrupted;
+			const fromGeneration = l.record.generation;
+			// Every way out below that does not resume it turns the interrupt into a stop.
+			const notResumed = (why: string) => {
+				if (interrupted) safely(() => abortRestart(runDir, params.id, fromGeneration, why));
+			};
 			if (!l.record.sessionFile || !fs.existsSync(l.record.sessionFile)) {
+				notResumed("was stopped by the parent (it could not be resumed)");
 				return {
 					content: [
 						{
@@ -1013,6 +1052,7 @@ export default function (pi: ExtensionAPI) {
 			const agents = discoverAgents(root);
 			const agent = agents.get(l.record.agent);
 			if (!agent) {
+				notResumed("was stopped by the parent (it could not be resumed)");
 				return {
 					content: [{ type: "text", text: `Agent "${l.record.agent}" no longer exists.` }],
 					isError: true,
@@ -1029,6 +1069,7 @@ export default function (pi: ExtensionAPI) {
 			);
 			const { maxConcurrentWriters } = config();
 			if (writes.length && runningWriters.length >= maxConcurrentWriters) {
+				notResumed("was stopped by the parent (it could not be resumed: writer limit reached)");
 				return {
 					content: [
 						{
@@ -1044,7 +1085,7 @@ export default function (pi: ExtensionAPI) {
 			// The previous generation's undelivered mail is settled now, so a resumed
 			// child never receives messages addressed to a run it no longer is.
 			safely(() => reconcileSessionFile(runDir, l.record.sessionFile));
-			safely(() => settleMessages(runDir, l.record.id, l.record.generation, "previous generation ended"));
+			safely(() => settleMessages(runDir, l.record.id, l.record.generation, "has finished"));
 			const verdict = withLock(runDir, () => {
 				const reg = readRegistry(runDir, runId, root);
 				reap(reg);
@@ -1067,8 +1108,12 @@ export default function (pi: ExtensionAPI) {
 				return a;
 			});
 			if (!verdict.ok) {
+				notResumed("was stopped by the parent (it could not be resumed: its write claim conflicts)");
 				return { content: [{ type: "text", text: verdict.reason! }], isError: true, details: undefined };
 			}
+			// The old session is reconciled and the new generation registered: hand
+			// it everything that queued up for the old one, before it starts.
+			if (interrupted) safely(() => finishRestart(runDir, params.id, fromGeneration, fromGeneration + 1));
 
 			const record: ChildRecord = {
 				...l.record,
@@ -1733,7 +1778,7 @@ export default function (pi: ExtensionAPI) {
 			const child = live.get(id);
 			if (child) {
 				safely(() => reconcileSessionFile(runDir, child.record.sessionFile));
-				safely(() => closeInbox(runDir, { id, generation: child.record.generation }, why));
+				safely(() => closeInbox(runDir, { id, generation: child.record.generation }, "ended with its parent session"));
 			}
 			// Signal the child's whole process group: killing only the child leaves
 			// whatever its bash tool started still running and still writing.

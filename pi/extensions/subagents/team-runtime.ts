@@ -69,7 +69,7 @@ export function deliveryBoundary(
 	// Never extend a run that was aborted, errored, or is being stood down: the
 	// mail stays queued and the parent's settlement reports it as undelivered.
 	if (standingDown || (event.outcome && event.outcome !== "completed")) {
-		if (final) closeInbox(runDir, actor, standingDown ? "stood down" : `run ${event.outcome}`);
+		if (final) closeInbox(runDir, actor, standingDown ? "stood down (its parent session ended)" : `stopped (run ${event.outcome})`);
 		return undefined;
 	}
 	const prepared = prepareDelivery(runDir, actor, final);

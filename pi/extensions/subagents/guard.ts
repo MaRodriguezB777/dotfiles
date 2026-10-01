@@ -567,11 +567,12 @@ export default function (pi: ExtensionAPI) {
 
 		pi.registerTool({
 			...MESSAGE_TEAM_SPEC,
-			async execute(_id, params: { to: string; text: string; reply_to?: string; needs_reply?: boolean }) {
+			async execute(_id, params: { to: string; text: string; thread?: string; new_thread?: string; needs_reply?: boolean }) {
 				try {
 					const r = sendMessage(RUN_DIR, me, params);
+					const where = r.thread === "default" ? "default thread" : `thread ${r.thread}`;
 					return {
-						content: [{ type: "text", text: `Queued ${r.message_id} in thread ${r.thread_id} for ${r.to}. Continue your own work; replies arrive automatically.` }],
+						content: [{ type: "text", text: `Sent to ${r.to} (${where}). Continue your own work; replies arrive automatically.` }],
 						details: r,
 					};
 				} catch (e) {
@@ -583,7 +584,10 @@ export default function (pi: ExtensionAPI) {
 
 		pi.registerTool({
 			...TEAM_MESSAGES_SPEC,
-			async execute(_id, params: { thread_id?: string; view?: "unread" | "recent" | "all"; cursor?: string; limit?: number }) {
+			async execute(
+				_id,
+				params: { with?: string; thread?: string; view?: "unread" | "recent" | "all"; cursor?: string; limit?: number },
+			) {
 				try {
 					const r = readMessages(RUN_DIR, me, params);
 					return { content: [{ type: "text", text: r.text }], details: r.details };

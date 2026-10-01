@@ -16,7 +16,7 @@
 import * as crypto from "node:crypto";
 import type { ChildRecord, Registry } from "../types.ts";
 import { pidAlive, withLock } from "../registry.ts";
-import { resolveRecipient } from "../naming.ts";
+import { NAME_RE, resolveRecipient } from "../naming.ts";
 import {
 	isMessageId,
 	isThreadId,
@@ -47,7 +47,6 @@ export type { Actor, DeliveryReceipt, ReadOptions, ReadResult, SendInput, Stored
 
 export const MAX_TEXT_CHARS = 32_000;
 export const MAX_OUTSTANDING_PER_SENDER = 32;
-export const MAX_MESSAGES_PER_RUN = 1000;
 export const MAX_DELIVERY_MESSAGES = 8;
 export const MAX_DELIVERY_CHARS = 8000;
 export const INLINE_BODY_CHARS = 2000;
@@ -58,8 +57,12 @@ export const MAX_QUEUED_NOTICES_PER_SENDER = 8;
 const TEAM_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,31}$/;
 const RESERVED_TEAMS = new Set(["none", "all", "any", "self", "parent", "everyone", "team", "*"]);
 
-/** A ChildRecord once the parent has added the messaging fields. */
-type MsgChild = ChildRecord & { team?: string; acceptingMessages?: boolean };
+/**
+ * A ChildRecord once the parent has added the messaging fields. `restarting`
+ * is the generation being interrupted-and-resumed by the parent: while set,
+ * that agent's mail is kept for the generation that follows (finishRestart).
+ */
+type MsgChild = ChildRecord & { team?: string; acceptingMessages?: boolean; restarting?: number };
 type MsgRegistry = Registry & { teams?: Record<string, Team> };
 
 // ---------------------------------------------------------------------------
@@ -111,6 +114,66 @@ function sameActor(a: Actor, b: Actor): boolean {
 
 function participantIds(th: Thread): string[] {
 	return th.participants.map((p) => p.id);
+}
+
+function isPair(th: Thread, a: string, b: string): boolean {
+	const ids = participantIds(th);
+	return ids.length === 2 && ids.includes(a) && ids.includes(b);
+}
+
+const isNamed = (th: Thread) => !!th.name && th.name !== "default";
+
+/** How agents see a thread's name: "default", "bench-v2", or "t-… (older thread)". */
+function threadLabel(th: Thread): string {
+	return th.name ?? `${th.id} (older thread)`;
+}
+
+/** Value an agent passes as `thread:` to reach this thread again. */
+function threadRef(th: Thread): string {
+	return th.name ?? th.id;
+}
+
+/** Threads between `me` and `other`, matching a name, handle or t- id. */
+function pairThreads(threads: Thread[], me: string, other: string, team: string): Thread[] {
+	return threads.filter((t) => t.team === team && isPair(t, me, other));
+}
+
+function matchesRef(th: Thread, ref: string): boolean {
+	return th.id === ref || th.handle === ref || th.name === ref;
+}
+
+/** The generation a failure notice is owed to. */
+function noticeGeneration(m: StoredMessage): number {
+	return m.failure?.notify ?? m.from.generation;
+}
+
+/** Completes "<id> …" for a recipient that cannot take messages now. */
+function stateClause(rec: MsgChild): string {
+	switch (rec.state) {
+		case "killed":
+			return "was stopped by the parent";
+		case "failed":
+			return "failed";
+		case "orphaned":
+			return "lost its parent session";
+		case "running":
+		case "done":
+			return "has finished";
+		default:
+			return `is ${rec.state}`;
+	}
+}
+
+function normalizeThreadName(raw: unknown): string {
+	const name = String(raw ?? "").trim().toLowerCase();
+	if (!NAME_RE.test(name)) {
+		fail(
+			`invalid thread name ${JSON.stringify(String(raw ?? "").slice(0, 40))}: use 1-32 lowercase letters, ` +
+				`digits, "-" or "_" (e.g. "bench-v2")`,
+		);
+	}
+	if (name === "default") fail(`thread name "default" is reserved; omit thread to use the default thread`);
+	return name;
 }
 
 function mergeRange(m: StoredMessage, start: number, end: number, session: string | null = null): void {
@@ -205,7 +268,7 @@ export function sendMessage(
 	runDir: string,
 	actor: Actor,
 	input: SendInput,
-): { message_id: string; thread_id: string; to: string } {
+): { message_id: string; thread_id: string; thread: string; handle: string; to: string } {
 	const text = typeof input?.text === "string" ? input.text : "";
 	if (!text.trim()) fail("message text is empty");
 	if (text.length > MAX_TEXT_CHARS) {
@@ -213,10 +276,9 @@ export function sendMessage(
 	}
 	let to = typeof input?.to === "string" ? input.to.trim() : "";
 	if (!to) fail("no recipient given");
-	const replyTo = input?.reply_to == null ? null : String(input.reply_to).trim();
-	if (replyTo !== null && !isThreadId(replyTo) && !isMessageId(replyTo)) {
-		fail(`invalid reply_to ${JSON.stringify(replyTo.slice(0, 40))}`);
-	}
+	const ref = input?.thread == null || String(input.thread).trim() === "" ? null : String(input.thread).trim();
+	const newName = input?.new_thread == null || String(input.new_thread).trim() === "" ? null : normalizeThreadName(input.new_thread);
+	if (ref !== null && newName !== null) fail("give either thread or new_thread, not both");
 
 	return withLock(runDir, () => {
 		const reg = loadRegistry(runDir) as MsgRegistry;
@@ -245,25 +307,20 @@ export function sendMessage(
 		if (myTeam === "none") fail("you are not on a team, so you cannot send messages");
 		if (theirTeam === "none") fail(`agent ${to} is not on a team`);
 		if (myTeam !== theirTeam) fail(`agent ${to} is on a different team ("${theirTeam}", you are on "${myTeam}")`);
-		// A finishing child has closed its inbox; to the sender that is the same as finished.
-		if (!isRunning(recipient) || !accepting(recipient)) {
-			const why = recipient.state === "running" || recipient.state === "done" ? "has finished" : `is ${recipient.state}`;
-			fail(`Not delivered: ${to} ${why}. Only the parent can resume it.`);
+		// Being interrupted and resumed by the parent is not finishing: queue it.
+		const restarting = recipient.restarting === recipient.generation;
+		if (!restarting && (!isRunning(recipient) || !accepting(recipient))) {
+			fail(`Not delivered: ${to} ${stateClause(recipient)}. Only the parent can resume it.`);
 		}
 
 		const threads = loadThreads(runDir);
-		let total = 0;
 		let maxSeq = -1;
 		let outstanding = 0;
 		for (const th of threads) {
-			total += th.messages.length;
 			for (const m of th.messages) {
 				if (typeof m.seq === "number" && m.seq > maxSeq) maxSeq = m.seq;
 				if (m.from.id === actor.id && m.inbound.state === "queued") outstanding++;
 			}
-		}
-		if (total >= MAX_MESSAGES_PER_RUN) {
-			fail(`this run has reached the message limit (${MAX_MESSAGES_PER_RUN.toLocaleString("en-US")})`);
 		}
 		if (outstanding >= MAX_OUTSTANDING_PER_SENDER) {
 			fail(
@@ -272,29 +329,36 @@ export function sendMessage(
 			);
 		}
 
-		let thread: Thread | null = null;
-		if (replyTo) {
-			thread = isThreadId(replyTo)
-				? loadThread(runDir, replyTo)
-				: (threads.find((t) => t.messages.some((m) => m.id === replyTo)) ?? null);
-			if (!thread) fail(`no such reply_to "${replyTo}"`);
-			const ids = participantIds(thread);
-			if (!ids.includes(actor.id) || !ids.includes(to)) {
-				fail(`reply_to thread ${thread.id} has different participants (${ids.join(", ")})`);
+		const mine = pairThreads(threads, actor.id, to, myTeam);
+		const participants = [
+			{ id: actor.id, generation: sender.generation },
+			{ id: to, generation: recipient.generation },
+		];
+		let thread: Thread;
+		if (newName !== null) {
+			if (mine.some((t) => t.name === newName)) {
+				fail(`Thread "${newName}" with ${to} already exists. Send to it with thread: "${newName}".`);
 			}
-			if (thread.team !== myTeam) fail(`reply_to thread ${thread.id} belongs to team "${thread.team}"`);
+			const taken = new Set(threads.map((t) => t.handle).filter(Boolean));
+			let handle: string;
+			do handle = `${newName}-${crypto.randomBytes(2).toString("hex")}`;
+			while (taken.has(handle));
+			thread = { version: 1, id: newThreadId(), name: newName, handle, team: myTeam, participants, createdAt: Date.now(), messages: [] };
+		} else if (ref !== null) {
+			const hit = mine.filter((t) => matchesRef(t, ref));
+			if (hit.length !== 1) {
+				const names = mine.map((t) => threadRef(t));
+				fail(
+					`no thread "${ref}" with ${to}` +
+						(names.length ? ` (threads with ${to}: ${names.join(", ")})` : "") +
+						`. Omit thread for the default thread, or start one with new_thread.`,
+				);
+			}
+			thread = hit[0];
 		} else {
-			thread = {
-				version: 1,
-				id: newThreadId(),
-				team: myTeam,
-				participants: [
-					{ id: actor.id, generation: sender.generation },
-					{ id: to, generation: recipient.generation },
-				],
-				createdAt: Date.now(),
-				messages: [],
-			};
+			thread =
+				mine.find((t) => t.name === "default") ??
+				({ version: 1, id: newThreadId(), name: "default", handle: "default", team: myTeam, participants, createdAt: Date.now(), messages: [] } as Thread);
 		}
 
 		const message: StoredMessage = {
@@ -305,14 +369,13 @@ export function sendMessage(
 			at: Date.now(),
 			text,
 			needs_reply: !!input.needs_reply,
-			reply_to: replyTo && isMessageId(replyTo) ? replyTo : null,
 			inbound: { state: "queued", at: null, reason: null },
 			read: { ranges: [], full: false, at: null, session: null },
 			failure: null,
 		};
 		thread.messages.push(message);
 		saveThread(runDir, thread);
-		return { message_id: message.id, thread_id: thread.id, to };
+		return { message_id: message.id, thread_id: thread.id, thread: threadRef(thread), handle: thread.handle ?? thread.id, to };
 	});
 }
 
@@ -328,21 +391,34 @@ interface Candidate {
 	msg: StoredMessage;
 }
 
-function inlineBlock(m: StoredMessage, threadId: string): string {
-	const reply = m.needs_reply ? " (reply requested)" : "";
-	return `New message ${m.id}, thread ${threadId}, from agent ${m.from.id}${reply}:\n${m.text}`;
+/** The exact call that answers in the same thread; older threads answer in default. */
+function replyCall(from: string, th: Thread): string {
+	return `message_team({ to: "${from}"${isNamed(th) ? `, thread: "${th.name}"` : ""} })`;
 }
 
-function noticeBlock(m: StoredMessage, threadId: string): string {
+function inlineBlock(m: StoredMessage, th: Thread): string {
+	const reply = m.needs_reply ? " (reply requested)" : "";
+	return `[${m.from.id} · ${threadLabel(th)}]${reply}\n${m.text}\nReply: ${replyCall(m.from.id, th)}`;
+}
+
+function noticeBlock(m: StoredMessage, th: Thread): string {
+	const read = isNamed(th) || !th.name ? `thread: "${threadRef(th)}"` : `with: "${m.from.id}"`;
 	return (
-		`New message ${m.id} (${m.text.length.toLocaleString("en-US")} chars), thread ${threadId}, ` +
-		`from agent ${m.from.id}.\nRead with team_messages({ thread_id: "${threadId}" }).`
+		`New message (${m.text.length.toLocaleString("en-US")} chars), thread ${threadLabel(th)}, ` +
+		`from agent ${m.from.id}.\nRead with team_messages({ ${read} }).`
 	);
 }
 
-function failureBlock(m: StoredMessage): string {
-	const reason = m.failure?.reason ?? "recipient finished";
-	return `Message ${m.id} to agent ${m.to.id} was not delivered (${reason}).`;
+function failureBlock(m: StoredMessage, th: Thread): string {
+	// Reasons recorded before this wording ("recipient failed") read as clauses too.
+	const reason = (m.failure?.reason ?? "has finished").replace(/^recipient /, "");
+	const flat = m.text.replace(/\s+/g, " ").trim();
+	const snippet = flat.length > 80 ? `${flat.slice(0, 79)}…` : flat;
+	const where = th.name === "default" ? "default thread" : `thread ${threadLabel(th)}`;
+	return (
+		`Your message to ${m.to.id} (${where}) "${snippet}" was not delivered: ` +
+		`${m.to.id} ${reason}. Only the parent can resume it.`
+	);
 }
 
 /**
@@ -374,7 +450,12 @@ export function prepareDelivery(
 				) {
 					candidates.push({ kind: "inbound", seq: m.seq ?? m.at, thread: th, msg: m });
 				}
-				if (sameActor(m.from, actor) && m.failure && m.failure.notice.state === "queued") {
+				if (
+					m.from.id === actor.id &&
+					m.failure &&
+					noticeGeneration(m) === actor.generation &&
+					m.failure.notice.state === "queued"
+				) {
 					candidates.push({ kind: "failure", seq: m.seq ?? m.at, thread: th, msg: m });
 				}
 			}
@@ -396,12 +477,12 @@ export function prepareDelivery(
 			let block: string;
 			let isFull = false;
 			if (c.kind === "failure") {
-				block = failureBlock(c.msg);
+				block = failureBlock(c.msg, c.thread);
 			} else if (c.msg.text.length <= INLINE_BODY_CHARS) {
-				block = inlineBlock(c.msg, c.thread.id);
+				block = inlineBlock(c.msg, c.thread);
 				isFull = true;
 			} else {
-				block = noticeBlock(c.msg, c.thread.id);
+				block = noticeBlock(c.msg, c.thread);
 			}
 			const cost = block.length + (blocks.length ? 2 : 0);
 			if (blocks.length > 0 && used + cost > MAX_DELIVERY_CHARS) break;
@@ -453,7 +534,13 @@ export function acknowledgeDelivery(runDir: string, receipt: DeliveryReceipt): v
 						dirty = true;
 					}
 				}
-				if (failures.has(m.id) && sameActor(m.from, receipt.actor) && m.failure?.notice.state === "queued") {
+				if (
+					failures.has(m.id) &&
+					m.from.id === receipt.actor.id &&
+					m.failure &&
+					noticeGeneration(m) === receipt.actor.generation &&
+					m.failure.notice.state === "queued"
+				) {
 					m.failure.notice.state = "delivered";
 					m.failure.notice.at = now;
 					dirty = true;
@@ -474,6 +561,8 @@ export function closeInbox(runDir: string, actor: Actor, reason: string): void {
 	withLock(runDir, () => {
 		const reg = loadRegistry(runDir) as MsgRegistry;
 		const rec = child(reg, actor.id);
+		// The parent is resuming this agent: its mail is kept for the next generation.
+		if (rec?.restarting === actor.generation) return;
 		if (rec && rec.generation === actor.generation && rec.acceptingMessages !== false) {
 			rec.acceptingMessages = false;
 			saveRegistry(runDir, reg);
@@ -502,6 +591,8 @@ export function settleMessages(runDir: string, id: string, generation: number, r
 	withLock(runDir, () => {
 		const reg = loadRegistry(runDir) as MsgRegistry;
 		const rec = child(reg, id);
+		// Interrupted and being resumed: not over. finishRestart carries the mail.
+		if (rec?.restarting === generation) return;
 		// Never touch a record that has already moved on to a later generation.
 		if (rec && rec.generation === generation && rec.acceptingMessages !== false) {
 			rec.acceptingMessages = false;
@@ -528,12 +619,12 @@ export function settleMessages(runDir: string, id: string, generation: number, r
 				const sender = child(reg, m.from.id);
 				const k = `${m.from.id}#${m.from.generation}`;
 				const queued = queuedPerSender.get(k) ?? 0;
+				// A sender being resumed gets its notice in the next generation.
 				const reachable =
 					!!sender &&
-					sender.generation === m.from.generation &&
-					isRunning(sender) &&
-					accepting(sender) &&
-					queued < MAX_QUEUED_NOTICES_PER_SENDER;
+					queued < MAX_QUEUED_NOTICES_PER_SENDER &&
+					(sender.restarting === m.from.generation ||
+						(sender.generation === m.from.generation && isRunning(sender) && accepting(sender)));
 				m.failure = { reason: why, at: now, notice: { state: reachable ? "queued" : "retained", at: null } };
 				if (reachable) queuedPerSender.set(k, queued + 1);
 				dirty = true;
@@ -541,6 +632,68 @@ export function settleMessages(runDir: string, id: string, generation: number, r
 			if (dirty) saveThread(runDir, th);
 		}
 	});
+}
+
+// ---------------------------------------------------------------------------
+// Interrupt and resume: the same agent continuing
+// ---------------------------------------------------------------------------
+
+/**
+ * The parent is about to stop agent (id, generation) only to resume it. Until
+ * finishRestart or abortRestart: sends to it are queued, and nothing addressed
+ * to it, or owed to it as a failure notice, is failed by the stop.
+ */
+export function beginRestart(runDir: string, id: string, generation: number): void {
+	withLock(runDir, () => {
+		const reg = loadRegistry(runDir) as MsgRegistry;
+		const rec = child(reg, id);
+		if (!rec || rec.generation !== generation) return;
+		rec.restarting = generation;
+		saveRegistry(runDir, reg);
+	});
+}
+
+/**
+ * The resume started as generation `to`: everything still queued for `from`
+ * moves to it — inbound mail and failure notices alike. Call it after the old
+ * session file was reconciled, so nothing it already received is sent twice.
+ */
+export function finishRestart(runDir: string, id: string, from: number, to: number): void {
+	withLock(runDir, () => {
+		const reg = loadRegistry(runDir) as MsgRegistry;
+		const rec = child(reg, id);
+		if (rec && rec.restarting === from) {
+			delete rec.restarting;
+			saveRegistry(runDir, reg);
+		}
+		for (const th of loadThreads(runDir)) {
+			let dirty = false;
+			for (const m of th.messages) {
+				if (m.to.id === id && m.to.generation === from && m.inbound.state === "queued") {
+					m.to.generation = to;
+					dirty = true;
+				}
+				if (m.from.id === id && m.failure?.notice.state === "queued" && noticeGeneration(m) === from) {
+					m.failure.notify = to;
+					dirty = true;
+				}
+			}
+			if (dirty) saveThread(runDir, th);
+		}
+	});
+}
+
+/** The resume did not happen after all: the stop now counts, with this reason. */
+export function abortRestart(runDir: string, id: string, generation: number, reason: string): void {
+	withLock(runDir, () => {
+		const reg = loadRegistry(runDir) as MsgRegistry;
+		const rec = child(reg, id);
+		if (rec && rec.restarting === generation) {
+			delete rec.restarting;
+			saveRegistry(runDir, reg);
+		}
+	});
+	settleMessages(runDir, id, generation, reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -619,10 +772,8 @@ function messageHeader(m: StoredMessage, actor: Actor, from: number, to: number,
 export function readMessages(runDir: string, actor: Actor, opts: ReadOptions = {}): ReadResult {
 	const rawCursor = opts.cursor ? String(opts.cursor) : null;
 	const cursor = rawCursor ? decodeCursor(rawCursor, actor) : null;
-	const threadId = cursor ? cursor.t : opts.thread_id ? String(opts.thread_id).trim() : null;
-	if (threadId !== null && !isThreadId(threadId)) {
-		fail(`invalid thread id ${JSON.stringify(String(threadId).slice(0, 40))}`);
-	}
+	const ref = String(opts.thread ?? opts.thread_id ?? "").trim() || null;
+	const withRef = String(opts.with ?? "").trim() || null;
 	const view = cursor && cursor.v !== "index" ? cursor.v : (opts.view ?? "unread");
 	if (!["unread", "recent", "all"].includes(view)) fail(`unknown view "${view}"`);
 	const budget = Math.max(
@@ -630,11 +781,49 @@ export function readMessages(runDir: string, actor: Actor, opts: ReadOptions = {
 		Math.min(MAX_READ_CHARS, typeof opts.limit === "number" && opts.limit > 0 ? opts.limit : MAX_READ_CHARS),
 	);
 
-	return withLock(runDir, () =>
-		threadId
+	return withLock(runDir, () => {
+		let threadId = cursor ? cursor.t : null;
+		if (!cursor && (ref || withRef)) {
+			const found = resolveReadTarget(runDir, actor, ref, withRef);
+			if (typeof found !== "string") return found;
+			threadId = found;
+		}
+		return threadId
 			? readThreadPage(runDir, actor, threadId, view as "unread" | "recent" | "all", cursor, budget)
-			: readIndex(runDir, actor, cursor, budget),
-	);
+			: readIndex(runDir, actor, cursor, budget);
+	});
+}
+
+/** Thread id for `thread`/`with`, or a ready answer (e.g. nothing yet). Caller holds the lock. */
+function resolveReadTarget(runDir: string, actor: Actor, ref: string | null, withRef: string | null): string | ReadResult {
+	const reg = loadRegistry(runDir) as MsgRegistry;
+	let mine = loadThreads(runDir).filter((t) => participantIds(t).includes(actor.id));
+	let other: string | null = null;
+	if (withRef) {
+		try {
+			other = resolveRecipient(reg.children, actor.id, withRef);
+		} catch (e) {
+			fail((e as Error).message);
+		}
+		if (!child(reg, other)) fail(`no such agent "${withRef}". ${teammates(runDir, actor.id).trim()}`);
+		mine = mine.filter((t) => isPair(t, actor.id, other!));
+	}
+	if (!ref) {
+		const def = mine.find((t) => t.name === "default");
+		if (def) return def.id;
+		return { text: `No messages with ${other} yet.`, details: { view: "thread", thread_id: null, messages: [] } };
+	}
+	const hit = mine.filter((t) => matchesRef(t, ref));
+	if (hit.length === 1) return hit[0].id;
+	const peer = (t: Thread) => participantIds(t).find((p) => p !== actor.id) ?? actor.id;
+	if (hit.length > 1) {
+		fail(
+			`thread "${ref}" is ambiguous: ${hit.map((t) => `${t.handle ?? t.id} (with ${peer(t)})`).join(", ")}. ` +
+				`Use the full name or add with.`,
+		);
+	}
+	const names = [...new Set(mine.filter(isNamed).map((t) => t.name!))];
+	fail(`no thread "${ref}"${other ? ` with ${other}` : ""}${names.length ? ` (named threads: ${names.join(", ")})` : ""}`);
 }
 
 /** Bounded teammate list: ids are what the model needs to address anyone. */
@@ -664,6 +853,8 @@ function readIndex(runDir: string, actor: Actor, cursor: Cursor | null, budget: 
 		const other = participantIds(th).find((p) => p !== actor.id) ?? actor.id;
 		rows.push({
 			thread_id: th.id,
+			label: threadLabel(th),
+			ref: isNamed(th) || !th.name ? `thread: "${threadRef(th)}"` : `with: "${other}"`,
 			team: th.team,
 			with: other,
 			unread,
@@ -698,7 +889,7 @@ function readIndex(runDir: string, actor: Actor, cursor: Cursor | null, budget: 
 	for (let i = start; i < rows.length; i++) {
 		const r = rows[i];
 		const line =
-			`- ${r.thread_id} · with ${r.with} · team ${r.team} · ${r.unread} unread of ${r.total} · ` +
+			`- ${r.label} with ${r.with} · ${r.unread} unread of ${r.total} · ` +
 			`last ${ago(r.last_at)}${r.failed ? ` · ${r.failed} of yours undelivered` : ""}\n`;
 		if (shown.length > 0 && text.length + line.length > room) {
 			next = i;
@@ -723,7 +914,11 @@ function readIndex(runDir: string, actor: Actor, cursor: Cursor | null, budget: 
 		});
 		text += `\n${rows.length - next} more thread(s): team_messages({ cursor: "${cursorOut}" })`;
 	} else {
-		text += `\nRead one with team_messages({ thread_id: "${shown[0].thread_id}" }).`;
+		// One example of each way to open a thread, taken from what is listed.
+		const ways = [shown.find((r) => r.ref.startsWith("with:")), shown.find((r) => r.ref.startsWith("thread:"))]
+			.filter(Boolean)
+			.map((r) => `team_messages({ ${r.ref} })`);
+		text += `\nRead with ${ways.join(" or ")}.`;
 	}
 	return {
 		text,
@@ -756,13 +951,14 @@ function readThreadPage(
 	else list = pool;
 
 	const other = participantIds(th).find((p) => p !== actor.id) ?? actor.id;
-	const head = `Thread ${th.id} (team ${th.team}, with agent ${other}) — ${view}, ${list.length} message(s):\n`;
+	const name = isNamed(th) ? `${th.name} (${th.handle})` : threadLabel(th);
+	const head = `Thread ${name} with ${other} (team ${th.team}) — ${view}, ${list.length} message(s):\n`;
 
 	if (list.length === 0) {
 		const empty =
 			view === "unread"
-				? `No unread messages in thread ${th.id}. Use view "recent" to see the last ${RECENT_WINDOW}.`
-				: `Thread ${th.id} has no messages.`;
+				? `No unread messages in thread ${name} with ${other}. Use view "recent" to see the last ${RECENT_WINDOW}.`
+				: `Thread ${name} has no messages.`;
 		return { text: empty, details: { view, thread_id: th.id, messages: [], cursor: null, truncated: false } };
 	}
 

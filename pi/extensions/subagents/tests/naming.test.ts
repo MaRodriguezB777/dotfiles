@@ -62,7 +62,7 @@ test("spawn and message_team schemas describe naming", () => {
 	assert.equal(text.SPAWN_SPEC.parameters.properties.name.type, "string");
 	assert.ok(!text.SPAWN_SPEC.parameters.required.includes("name"));
 	assert.match(text.SPAWN_SPEC.parameters.properties.name.description, /cleanup-3a1f/);
-	assert.match(text.MESSAGE_TEAM_SPEC.parameters.properties.to.description, /just its name/);
+	assert.match(text.MESSAGE_TEAM_SPEC.parameters.properties.to.description, /its name if unique/);
 	const agent = { name: "worker", description: "", prompt: "p", source: "test" };
-	assert.match(text.childSystemPrompt(agent, [], "BOARD.md", { name: "api", goal: "g" }), /by name alone when no other teammate/);
+	assert.match(text.childSystemPrompt(agent, [], "BOARD.md", { name: "api", goal: "g" }), /by ID or unique name/);
 });

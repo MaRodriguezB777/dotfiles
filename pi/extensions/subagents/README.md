@@ -62,16 +62,28 @@ and gets two tools for talking to **its own team only**:
 
 | tool | behaviour |
 | --- | --- |
-| `message_team({ to, text, reply_to?, needs_reply? })` | message one running teammate; returns immediately. `to` is the full ID or, if unique on the team, just the name. `reply_to` continues a thread. |
-| `team_messages({ thread_id?, view?, cursor? })` | no arguments: thread index with unread counts. `thread_id`: unread incoming messages; `view: "recent"` or `"all"` for history (paged). |
+| `message_team({ to, text, thread?, new_thread?, needs_reply? })` | message one running teammate; returns immediately. `to` is the full ID or, if unique on the team, just the name. Goes to the pair's **default thread**; `new_thread: "bench-v2"` starts a named thread (an error if that name already exists with this teammate), `thread: "bench-v2"` continues it. |
+| `team_messages({ with?, thread?, view?, cursor? })` | no arguments: teammates and their threads with unread counts. `with`: unread in the default thread with that teammate; `thread`: a named thread (name, or `bench-v2-3f1a` when two teammates use the same name). `view: "recent"` or `"all"` for history (paged). |
 
 - Messages of ≤2,000 characters are delivered automatically at the next
-  safe turn boundary, never during a tool call. Longer ones arrive as a notice:
-  `New message m-17 (6,420 chars), thread t-3, from agent c-api.`
+  safe turn boundary, never during a tool call, with the exact reply call:
+  ```
+  [jepa-m2-7500 · default] (reply requested)
+  Can you share the m3 loss curve?
+  Reply: message_team({ to: "jepa-m2-7500" })
+  ```
+  Longer ones arrive as a notice:
+  `New message (6,420 chars), thread bench-v2, from agent jepa-m2-7500.`
 - A message to a finished agent is refused with
   `Not delivered: c-api has finished. Only the parent can resume it.`
   Messages queued when the recipient ends are marked undelivered and the
-  sender is told. Messages never restart an agent.
+  sender is told which message and why. Messages never restart an agent.
+- **Interrupting is not finishing.** When the parent uses `subagent_followup`
+  with `interrupt: true`, mail queued for the agent, and sends made while it
+  restarts, are delivered to the resumed agent instead of failing. If the
+  resume does not happen, they fail with the reason.
+- No cap on messages or threads per run; a sender may have at most 32 messages
+  still waiting for delivery.
 - `team: "none"` (the default) disables direct messaging entirely; the tools
   are not even registered. `note()` / `notes()` remain run-wide for everyone.
 - Messages are not assignments or permissions: territory still moves only via

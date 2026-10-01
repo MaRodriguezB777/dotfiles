@@ -36,9 +36,15 @@ export interface ReadState {
 }
 
 export interface Failure {
+	/** A clause completing "<recipient> …", e.g. "was stopped by the parent". */
 	reason: string;
 	at: number;
 	notice: { state: NoticeState; at: number | null };
+	/**
+	 * Sender generation the notice goes to, when not the one that sent it: an
+	 * interrupted-and-resumed sender gets its notices in the new generation.
+	 */
+	notify?: number;
 }
 
 export interface StoredMessage {
@@ -50,8 +56,8 @@ export interface StoredMessage {
 	at: number;
 	text: string;
 	needs_reply: boolean;
-	/** Message id this replies to, or null. Thread membership is separate. */
-	reply_to: string | null;
+	/** Only on messages from before named threads; no longer written. */
+	reply_to?: string | null;
 	inbound: { state: InboundState; at: number | null; reason: string | null };
 	read: ReadState;
 	failure: Failure | null;
@@ -59,7 +65,15 @@ export interface StoredMessage {
 
 export interface Thread {
 	version: 1;
+	/** Internal, path-safe: t-<hex>. */
 	id: string;
+	/**
+	 * "default" (one per pair) or a name an agent chose with new_thread.
+	 * Absent on threads from before named threads ("older threads").
+	 */
+	name?: string;
+	/** What agents may also use to address it: "default", or "<name>-<hex4>". */
+	handle?: string;
 	team: string;
 	/** Exactly two, with the generations current when the thread opened. */
 	participants: Actor[];
@@ -86,11 +100,19 @@ export interface DeliveryReceipt {
 export interface SendInput {
 	to: string;
 	text: string;
-	reply_to?: string | null;
+	/** Existing named thread with `to` (name, handle, or t- id). Omit: default thread. */
+	thread?: string;
+	/** Start a named thread; an error if the pair already has one by that name. */
+	new_thread?: string;
 	needs_reply?: boolean;
 }
 
 export interface ReadOptions {
+	/** Teammate whose default thread to read (or to narrow `thread` to). */
+	with?: string;
+	/** Named thread: name, handle, or t- id. */
+	thread?: string;
+	/** Older spelling of `thread`. */
 	thread_id?: string;
 	view?: "unread" | "recent" | "all";
 	cursor?: string | null;

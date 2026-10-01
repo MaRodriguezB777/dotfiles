@@ -23,7 +23,7 @@ test("prepareDelivery inlines small messages in full", () => {
 	const batch = prepareDelivery(runDir, actor("c-b", 1));
 	assert.ok(batch);
 	assert.match(batch.text, /please rebase onto main/);
-	assert.match(batch.text, new RegExp(sent.message_id));
+	assert.match(batch.text, /^\[c-a · default\]\n/);
 	assert.deepEqual(batch.receipt.inbound, [sent.message_id]);
 	assert.deepEqual(batch.receipt.actor, { id: "c-b", generation: 1 });
 	assert.deepEqual(JSON.parse(JSON.stringify(batch.receipt)), batch.receipt);
@@ -34,9 +34,10 @@ test("prepareDelivery announces long messages with the exact notice and no previ
 	const body = `SECRETBODY${"x".repeat(2490)}`;
 	const sent = sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: body });
 	const batch = prepareDelivery(runDir, actor("c-b", 1))!;
+	void sent;
 	const expected =
-		`New message ${sent.message_id} (${body.length.toLocaleString("en-US")} chars), thread ${sent.thread_id}, ` +
-		`from agent c-a.\nRead with team_messages({ thread_id: "${sent.thread_id}" }).`;
+		`New message (${body.length.toLocaleString("en-US")} chars), thread default, ` +
+		`from agent c-a.\nRead with team_messages({ with: "c-a" }).`;
 	assert.equal(batch.text, expected);
 	assert.ok(!batch.text.includes("SECRETBODY"));
 });
@@ -81,7 +82,6 @@ test("acknowledgeDelivery marks small bodies read, long bodies unread, and is id
 	const big = sendMessage(runDir, actor("c-a", 1), {
 		to: "c-b",
 		text: "z".repeat(2500),
-		reply_to: small.thread_id,
 	});
 	const batch = prepareDelivery(runDir, actor("c-b", 1))!;
 	acknowledgeDelivery(runDir, batch.receipt);
@@ -128,17 +128,20 @@ test("closeInbox stops delivery, marks queued inbound undelivered and never resu
 test("settleMessages fails queued inbound and notifies an active sender of the same generation", () => {
 	const { runDir } = pair(tmpRun());
 	const sent = sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: "did you get this?" });
-	settleMessages(runDir, "c-b", 1, "child finished");
+	settleMessages(runDir, "c-b", 1, "has finished");
 
 	const m = readThreadFile(runDir, sent.thread_id).messages[0];
 	assert.equal(m.inbound.state, "undelivered");
-	assert.equal(m.failure.reason, "child finished");
+	assert.equal(m.failure.reason, "has finished");
 	assert.equal(m.failure.notice.state, "queued");
 
 	const batch = prepareDelivery(runDir, actor("c-a", 1))!;
 	assert.deepEqual(batch.receipt.failures, [sent.message_id]);
-	assert.match(batch.text, /not delivered|failed/i);
-	assert.ok(!batch.text.includes("did you get this?"));
+	// The sender is shown the start of its own message, so it knows which one.
+	assert.equal(
+		batch.text,
+		'Your message to c-b (default thread) "did you get this?" was not delivered: c-b has finished. Only the parent can resume it.',
+	);
 	acknowledgeDelivery(runDir, batch.receipt);
 	assert.equal(readThreadFile(runDir, sent.thread_id).messages[0].failure.notice.state, "delivered");
 	assert.equal(prepareDelivery(runDir, actor("c-a", 1)), null);
@@ -159,7 +162,7 @@ test("settleMessages never touches a future generation of the same child", () =>
 	const { runDir } = pair(tmpRun());
 	const g1 = sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: "for gen 1" });
 	patchChild(runDir, "c-b", { generation: 2 });
-	const g2 = sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: "for gen 2", reply_to: g1.thread_id });
+	const g2 = sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: "for gen 2" });
 
 	settleMessages(runDir, "c-b", 1, "generation 1 ended");
 	const msgs = readThreadFile(runDir, g1.thread_id).messages;

@@ -38,7 +38,9 @@ test("the index lists only the caller's threads, unread first, with counts and n
 	assert.equal(out.details.threads[0].thread_id, t2.thread_id, "unread thread must sort first");
 	assert.equal(out.details.threads[0].unread, 1);
 	assert.equal(out.details.threads[1].unread, 0);
-	assert.match(out.text, new RegExp(t1.thread_id));
+	void t1;
+	assert.match(out.text, /default with c-a · 0 unread of 1/);
+	assert.match(out.text, /default with c-c · 1 unread of 1/);
 
 	// listing does not mark anything read
 	const again = readMessages(runDir, actor("c-b", 1), {});
@@ -58,13 +60,13 @@ test("the index hides threads the caller is not part of, including other teams",
 	const out = readMessages(runDir, actor("c-a", 1), {});
 	assert.ok(!out.text.includes(other.thread_id));
 	assert.ok(!out.text.includes("PRIVATEBETA"));
-	assert.throws(() => readMessages(runDir, actor("c-a", 1), { thread_id: other.thread_id }), /participant|no such thread/i);
+	assert.throws(() => readMessages(runDir, actor("c-a", 1), { thread_id: other.thread_id }), /participant|no (such )?thread/i);
 });
 
 test("thread ids that look like path traversal are rejected", () => {
 	const { runDir } = pair(tmpRun());
 	for (const bad of ["../claims", "t-../../x", "/etc/passwd", "t-x/../y", "claims"]) {
-		assert.throws(() => readMessages(runDir, actor("c-a", 1), { thread_id: bad }), /invalid|no such thread/i);
+		assert.throws(() => readMessages(runDir, actor("c-a", 1), { thread_id: bad }), /invalid|no (such )?thread/i);
 	}
 });
 
@@ -79,7 +81,7 @@ test("a corrupt thread file fails closed", () => {
 test("the default thread view shows unread incoming messages and marks them read", () => {
 	const { runDir } = pair(tmpRun());
 	const t = sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: "alpha body" });
-	sendMessage(runDir, actor("c-b", 1), { to: "c-a", text: "my own reply", reply_to: t.thread_id });
+	sendMessage(runDir, actor("c-b", 1), { to: "c-a", text: "my own reply" });
 
 	const out = readMessages(runDir, actor("c-b", 1), { thread_id: t.thread_id });
 	assert.match(out.text, /alpha body/);
@@ -96,7 +98,7 @@ test("recent shows the tail chronologically including own and already-read messa
 	for (let i = 0; i < 14; i++) {
 		const from = i % 2 === 0 ? "c-a" : "c-b";
 		const to = i % 2 === 0 ? "c-b" : "c-a";
-		const r = sendMessage(runDir, actor(from, 1), { to, text: `body-${i}`, reply_to: tid || undefined });
+		const r = sendMessage(runDir, actor(from, 1), { to, text: `body-${i}` });
 		tid = r.thread_id;
 	}
 	const out = readMessages(runDir, actor("c-b", 1), { thread_id: tid, view: "recent" });
@@ -146,11 +148,11 @@ test("output is bounded and long bodies page through a cursor, marking only cove
 test("a cursor continues over a stable snapshot and ignores messages that arrive mid-paging", () => {
 	const { runDir } = pair(tmpRun());
 	const a = sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: `A${"a".repeat(6000)}` });
-	sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: `B${"b".repeat(6000)}`, reply_to: a.thread_id });
+	sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: `B${"b".repeat(6000)}` });
 
 	let out = readMessages(runDir, actor("c-b", 1), { thread_id: a.thread_id });
 	assert.ok(out.details.cursor);
-	const late = sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: "LATEARRIVAL", reply_to: a.thread_id });
+	const late = sendMessage(runDir, actor("c-a", 1), { to: "c-b", text: "LATEARRIVAL" });
 
 	const texts: string[] = [out.text];
 	while (out.details.cursor) {

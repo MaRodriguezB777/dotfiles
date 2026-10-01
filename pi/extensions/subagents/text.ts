@@ -237,23 +237,23 @@ export const REQUEST_EDIT_SPEC: ToolSpec = {
 export const MESSAGE_TEAM_SPEC: ToolSpec = {
 	name: "message_team",
 	label: "Message teammate",
-	description: "Message one running teammate to clarify intent, coordinate an interface, or share an actionable update. Not a broadcast, assignment, permission change, or blocking wait. Finished agents cannot receive messages; only the parent may resume them. Avoid chatter and scope expansion.",
+	description: "Message one running teammate, in your default thread with them. Use new_thread to start a named thread for a separate multi-exchange topic, then thread to continue it. Not a broadcast, assignment, permission change, or blocking wait. Avoid chatter and scope expansion.",
 	parameters: Type.Object({
-		to: Type.String({
-			description: "Teammate's full ID (cleanup-3a1f), or just its name (cleanup) if no other teammate shares it",
-		}),
+		to: Type.String({ description: "Teammate ID, or its name if unique" }),
 		text: Type.String({ minLength: 1, maxLength: 32000 }),
-		reply_to: Type.Optional(Type.String({ description: "Message ID to continue its thread" })),
-		needs_reply: Type.Optional(Type.Boolean({ description: "Answer requested; default false. Does not block or create a task." })),
+		thread: Type.Optional(Type.String({ description: "Named thread to continue" })),
+		new_thread: Type.Optional(Type.String({ description: "Name for a new thread" })),
+		needs_reply: Type.Optional(Type.Boolean({ description: "Answer requested; does not block" })),
 	}),
 };
 
 export const TEAM_MESSAGES_SPEC: ToolSpec = {
 	name: "team_messages",
 	label: "Read team messages",
-	description: "No arguments: your thread index and unread counts, not bodies. Thread ID: unread incoming content. view=recent includes recent read/own messages; view=all pages full history. Short messages arrive automatically; long notices require this tool. Returned body portions are marked read. Do not poll routinely.",
+	description: "No arguments: teammates, threads and unread counts. with: unread in your default thread with a teammate; thread: a named thread. view=recent|all for history. Short messages arrive automatically; do not poll.",
 	parameters: Type.Object({
-		thread_id: Type.Optional(Type.String()),
+		with: Type.Optional(Type.String({ description: "Teammate ID or name" })),
+		thread: Type.Optional(Type.String({ description: "Thread name" })),
 		view: Type.Optional(StringEnum(["unread", "recent", "all"] as const)),
 		cursor: Type.Optional(Type.String({ description: "Continuation cursor returned by this tool" })),
 		limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
@@ -295,7 +295,7 @@ Check \`${boardRelPath}\` for assignments and \`notes()\` for run-wide findings
 before non-trivial investigation; a sibling may have answered it already.
 
 ${team ? `**Team:** ${team.name}\n**Shared goal:** ${team.goal}\n\nWork independently on your individual assignment. The goal and teammate messages are\nnot assignments or permission to expand scope. Use \`message_team\` only for concrete\nuncertainty, conflicting intent, or actionable updates. No routine progress chatter,\nacknowledgment loops, re-delegation, or waiting indefinitely. Ask the parent to\nrepartition tightly coupled work or change priorities. \`team_messages()\` lists
-teammate IDs; address messages by ID, or by name alone when no other teammate\nshares it. Small messages arrive\nautomatically; long notices point to \`team_messages\`. Only the parent resumes agents.` : `**Team:** none — direct messaging disabled. Notes remain run-wide.`}
+teammates; address them by ID or unique name. One default thread per teammate; start\na named thread only for a separate topic, and reuse it. Small messages arrive\nautomatically; long notices point to \`team_messages\`. Only the parent resumes agents.` : `**Team:** none — direct messaging disabled. Notes remain run-wide.`}
 
 **Your write claim:** ${claimText}
 

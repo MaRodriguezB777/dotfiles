@@ -16,9 +16,9 @@ test("team tools throw on rejection instead of returning isError", async () => {
 		const guard = (await import("../guard.ts")).default;
 		guard({ registerTool: (s: any) => tools.set(s.name, s), on() {} } as any);
 		await assert.rejects(tools.get("message_team").execute("x", { to: "nobody", text: "hi" }), /no such agent/);
-		await assert.rejects(tools.get("team_messages").execute("x", { thread_id: "t-zz" }), /.+/);
+		await assert.rejects(tools.get("team_messages").execute("x", { thread: "t-zz" }), /.+/);
 		const ok = await tools.get("message_team").execute("x", { to: "b", text: "hi" });
-		assert.match(ok.content[0].text, /Queued/);
+		assert.match(ok.content[0].text, /^Sent to b \(default thread\)\./);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

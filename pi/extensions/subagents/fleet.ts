@@ -81,6 +81,8 @@ interface MessageCounts {
 
 export interface ThreadView {
 	id: string;
+	/** "default", a chosen name, or the id for threads from before named threads. */
+	label: string;
 	/** Thread JSON on disk, re-read only when the thread is opened. */
 	file: string;
 	team: string;
@@ -126,6 +128,7 @@ function readThreads(runDir: string): ThreadView[] {
 			const ids = (th.participants ?? []).map((p: any) => String(p.id));
 			const t: ThreadView = {
 				id: String(th.id),
+				label: typeof th.name === "string" ? th.name : String(th.id),
 				file,
 				team: String(th.team ?? "none"),
 				between: [ids[0] ?? "?", ids[1] ?? "?"],
@@ -793,7 +796,7 @@ function messageLines(v: ChildView, theme: FleetTheme): string[] {
 		const other = t.between[0] === v.record.id ? t.between[1] : t.between[0];
 		const mine = t.sentBy[v.record.id] ?? 0;
 		out.push(
-			`    ${theme.fg("muted", `↔ ${other} · ${t.id} · ${plural(t.messages, "msg")} (${mine}↑ ${t.messages - mine}↓) · ${n(t.chars)} chars${flags(t)} · ${ago(t.lastAt)}`)}`,
+			`    ${theme.fg("muted", `↔ ${other} · ${t.label} · ${plural(t.messages, "msg")} (${mine}↑ ${t.messages - mine}↓) · ${n(t.chars)} chars${flags(t)} · ${ago(t.lastAt)}`)}`,
 		);
 	}
 	if (v.threads.length > MAX) out.push(`    ${theme.fg("dim", `… ${v.threads.length - MAX} more threads`)}`);
@@ -926,7 +929,7 @@ function teamDetail(t: TeamView, width: number, theme: FleetTheme, folded = fals
 		body.push("", theme.fg("accent", "Threads"));
 		for (const th of t.threads) {
 			body.push(
-				`  ${th.between[0]} ↔ ${th.between[1]} ${theme.fg("dim", `· ${th.id} · ${plural(th.messages, "msg")} · ${n(th.chars)} chars${flags(th)} · ${ago(th.lastAt)}`)}`,
+				`  ${th.between[0]} ↔ ${th.between[1]} ${theme.fg("dim", `· ${th.label} · ${plural(th.messages, "msg")} · ${n(th.chars)} chars${flags(th)} · ${ago(th.lastAt)}`)}`,
 			);
 		}
 		if (!t.threads.length) body.push(theme.fg("dim", "  (no messages yet)"));
@@ -953,7 +956,7 @@ function threadPicker(item: Item, threads: ThreadView[], cursor: number, width: 
 		// From an agent, name the other side; from a team, both sides.
 		const who = self ? `↔ ${t.between[0] === self ? t.between[1] : t.between[0]}` : `${t.between[0]} ↔ ${t.between[1]}`;
 		const mine = self ? ` (${t.sentBy[self] ?? 0}↑ ${t.messages - (t.sentBy[self] ?? 0)}↓)` : "";
-		const meta = `· ${t.id} · ${plural(t.messages, "msg")}${mine} · ${n(t.chars)} chars${flags(t)} · ${ago(t.lastAt)}`;
+		const meta = `· ${t.label} · ${plural(t.messages, "msg")}${mine} · ${n(t.chars)} chars${flags(t)} · ${ago(t.lastAt)}`;
 		return `${marker} ${sel ? theme.bold(who) : who} ${theme.fg("dim", meta)}`;
 	});
 	return { header: header.map((l) => truncateToWidth(l, w)), body: body.map((l) => truncateToWidth(l, w)) };
