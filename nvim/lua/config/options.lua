@@ -6,6 +6,15 @@ if vim.fn.hostname() == "hu-manurodr-lv" then
 else
   vim.o.shell = "/usr/bin/bash"
 end
+-- Keep Neovim's Python provider isolated from project virtual environments.
+-- `uv tool install pynvim` creates this interpreter; it must contain pynvim.
+local uv_tools_dir = vim.env.UV_TOOL_DIR
+  or ((vim.env.XDG_DATA_HOME or vim.fn.expand("~/.local/share")) .. "/uv/tools")
+local pynvim_python = uv_tools_dir .. "/pynvim/bin/python"
+if (vim.uv or vim.loop).fs_stat(pynvim_python) then
+  vim.g.python3_host_prog = pynvim_python
+end
+
 vim.g.lazyvim_python_lsp = "ty"
 vim.g.lazyvim_python_ruff = "ruff"
 vim.g.autoformat = false
